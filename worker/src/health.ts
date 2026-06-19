@@ -143,8 +143,8 @@ function determineReachabilityStatus(httpCode: number, responseTimeMs: number): 
 }
 
 // --- Layer 2: portal availability ---
-// UnB uses SIGAA's own authentication (not CAS/SSO). Check that the login
-// page renders and contains expected page content.
+// UnB migrated to CAS/SSO (autenticacao.unb.br). The SIGAA URL redirects to
+// the CAS portal — check that it renders and contains expected content.
 
 async function checkPortal(): Promise<LayerResult> {
   const start = Date.now();
@@ -159,7 +159,7 @@ async function checkPortal(): Promise<LayerResult> {
 
     const body = await res.text();
 
-    if (!body.includes("user.login") && !body.includes("SIGAA") && !body.includes("sigaa")) {
+    if (!body.includes("SIGAA") && !body.includes("sigaa") && !body.includes("sso-server")) {
       return { status: "offline", error: "login_page_missing_expected_content", responseTimeMs: Date.now() - start };
     }
 
@@ -171,8 +171,8 @@ async function checkPortal(): Promise<LayerResult> {
 }
 
 // --- Layer 3: login form fields ---
-// Verify the login form renders all required fields (user.login, user.senha).
-// Missing fields mean the JSF rendering pipeline is broken.
+// Verify the CAS login form renders the credential fields (username, password).
+// Missing fields mean the CAS portal rendering pipeline is broken.
 
 async function checkLoginForm(): Promise<LayerResult> {
   const start = Date.now();
@@ -187,7 +187,7 @@ async function checkLoginForm(): Promise<LayerResult> {
 
     const body = await res.text();
 
-    if (!body.includes('user.login') || !body.includes('user.senha')) {
+    if (!body.includes('name="username"') || !body.includes('name="password"')) {
       return { status: "offline", error: "login_form_missing_credentials_fields", responseTimeMs: Date.now() - start };
     }
 
