@@ -1,0 +1,22 @@
+{
+  "name": "sigaa-caiu-unb-worker",
+  "account_id": "add57c7093b25ef9ae443c414d12c81c",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-09-23",
+"triggers": {
+    "crons": ["* * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sigaa-caiu-unb-db",
+      "database_id": "226baee3-4dee-420e-979a-496d81e793a9"
+    }
+  ],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  }
+}

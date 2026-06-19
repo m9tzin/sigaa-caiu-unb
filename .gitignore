@@ -1,0 +1,6 @@
+node_modules
+.wrangler
+.next
+.vercel
+.env
+.dev.vars
