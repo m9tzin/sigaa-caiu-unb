@@ -81,6 +81,16 @@ sigaa-caiu-unb/
 └── README.md
 ```
 
+## Universidades
+
+Instancias do projeto rodando por ai:
+
+| Universidade | Site                                           |
+| ------------ | ---------------------------------------------- |
+| **UFPB**     | [sigaacaiu.com](https://sigaacaiu.com)         |
+| **UFG**      | [ufg.sigaacaiu.com](https://ufg.sigaacaiu.com) |
+| **UNB**      | [unb.sigaacaiu.com](https://unb.sigaacaiu.com) |
+
 ## Issues e sugestoes
 
 Abra uma [issue](https://github.com/m9tzin/sigaa-caiu-unb/issues) se encontrar um bug ou tiver uma sugestao.
