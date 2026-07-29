@@ -24,15 +24,6 @@ const ONLINE_RESPONSES = [
   { emoji: "👍",    text: "Nao, pode ir!",    sub: "Corre antes que caia." },
   { emoji: "🙏",    text: "Nao!",             sub: "Gracas a Deus e ao STI." },
   { emoji: "👍",    text: "Nao!",             sub: "Nao, voce nao ta sonhando." },
-  /* World Cup */
-  { emoji: "🇧🇷⚽", text: "Nao, ta firme!",        sub: "Aguentou o gol, o VAR e a revisao." },
-  { emoji: "🏆🇧🇷", text: "Nao, ta de pe!",         sub: "Sobreviveu ate a prorrogacao." },
-  { emoji: "⚽✅",   text: "Nao, fez o gol!",        sub: "Chutou no angulo e foi. GOLACO!"},
-  { emoji: "🇧🇷🏃", text: "Nao, driblou tudo!",     sub: "Passou por cima da instabilidade e ta no ar." },
-  { emoji: "🏟️🇧🇷", text: "Nao, escalado hoje!",    sub: "Saiu como titular e ta rendendo." },
-  { emoji: "🇧🇷🎺", text: "Nao!",                   sub: "Nem a vuvuzela desafinou o servidor hoje." },
-  { emoji: "🥅🇧🇷", text: "Nao, defendeu!",          sub: "Nem o ataque do dia de prova derrubou." },
-  { emoji: "📺🇧🇷", text: "Nao, ta no ar!",          sub: "Jogo comecando, SIGAA funcionando. Dia perfeito." },
 ];
 
 // prettier-ignore
@@ -42,9 +33,6 @@ const SLOW_RESPONSES = [
   { emoji: "🐢",  text: "Mais ou menos",         sub: "Ta funcionando em camera lenta." },
   { emoji: "⏳",  text: "Nao... ainda",          sub: "Pega um cafe enquanto carrega." },
   { emoji: "🦥",  text: "Nao, mas ta arrastando",sub: "Mais lento que matricula em periodo." },
-  /* World Cup */
-  { emoji: "🇧🇷", text: "Nao, mas ta na torcida",sub: "Um olho no jogo, outro no sistema." },
-  { emoji: "⏱🇧🇷", text: "Lento, igual VAR",     sub: "Ta analisando o lance ha 10 minutos." },
 ];
 
 // prettier-ignore
@@ -55,9 +43,6 @@ const DOWN_RESPONSES = [
   { emoji: "😭",    text: "Sim...",             sub: "Era previsivel, ne?" },
   { emoji: "🪦",    text: "Sim, foi de base",   sub: "Causa da morte: ser o SIGAA." },
   { emoji: "📚",    text: "Caiu!",              sub: "Deve estar fazendo prova." },
-  /* World Cup */
-  { emoji: "🇧🇷",   text: "Sim, foi ver o jogo!", sub: "O SIGAA foi assistir o Brasil jogar. Volta depois do apito final." },
-  { emoji: "🎊🇧🇷", text: "Caiu de emocao!",    sub: "Nao segurou o gol e foi junto. Volta quando se recuperar." },
 ];
 
 // prettier-ignore
