@@ -23,6 +23,19 @@ CREATE TABLE IF NOT EXISTS checks (
 
 CREATE INDEX IF NOT EXISTS idx_checks_timestamp ON checks(timestamp DESC);
 
+-- getLastKnownLayers issues one "WHERE <layer>_status IS NOT NULL ORDER BY timestamp
+-- DESC LIMIT 1" per layer on every /api/status request. These partial indexes match
+-- that predicate exactly, so the lookup never degrades into a table scan -- including
+-- when a layer is skipped for a long stretch and every row stores NULL for it.
+CREATE INDEX IF NOT EXISTS idx_checks_layer_reach
+  ON checks(timestamp DESC) WHERE reachability_status IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_checks_layer_portal
+  ON checks(timestamp DESC) WHERE portal_status IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_checks_layer_form
+  ON checks(timestamp DESC) WHERE login_form_status IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_checks_layer_e2e
+  ON checks(timestamp DESC) WHERE login_e2e_status IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS incidents (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   started_at TEXT    NOT NULL,
@@ -31,6 +44,12 @@ CREATE TABLE IF NOT EXISTS incidents (
 );
 
 CREATE INDEX IF NOT EXISTS idx_incidents_started ON incidents(started_at DESC);
+
+-- getOpenIncident looks for the single open incident on every request and every cron
+-- tick. This partial index holds at most one entry, so the common "none open" case
+-- costs nothing instead of scanning a table that is never pruned.
+CREATE INDEX IF NOT EXISTS idx_incidents_open
+  ON incidents(id) WHERE ended_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS other_service_checks (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
