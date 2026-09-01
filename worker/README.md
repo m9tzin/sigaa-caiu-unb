@@ -10,8 +10,11 @@ src/
   health.ts   ← health check do SIGAA (fetch + logica de status)
   db.ts       ← operacoes no D1 (salvar, consultar, incidentes)
   api.ts      ← rotas da API (/api/status, /history, /stats, /incidents)
+  cache.ts    ← cache de leitura da API publica (TTL por rota)
   cors.ts     ← headers CORS
   types.ts    ← interfaces TypeScript
+scripts/
+  cache-stats.mjs  ← taxa de acerto do cache a partir do trafego real
 schema.sql    ← schema do banco D1
 ```
 
@@ -21,7 +24,7 @@ schema.sql    ← schema do banco D1
 npm install
 
 # Criar banco local
-npx wrangler d1 execute sigaa-caiu-db --local --file=schema.sql
+npx wrangler d1 execute sigaa-caiu-unb-db --local --file=schema.sql
 
 # Rodar
 npx wrangler dev --port 8787 --test-scheduled
@@ -43,11 +46,14 @@ curl http://localhost:8787/api/incidents
 npx wrangler login
 
 # Criar banco D1
-npx wrangler d1 create sigaa-caiu-db
+npx wrangler d1 create sigaa-caiu-unb-db
 # Copiar o database_id retornado pro wrangler.jsonc
 
 # Aplicar schema no banco remoto
-npx wrangler d1 execute sigaa-caiu-db --remote --file=schema.sql
+npx wrangler d1 execute sigaa-caiu-unb-db --remote --file=schema.sql
+
+# Indices parciais que removem full table scans (ver secao Cache)
+npx wrangler d1 execute sigaa-caiu-unb-db --remote --file=schema_migration_cache_indexes.sql
 ```
 
 ## Deploy
@@ -64,3 +70,88 @@ incidents (id, started_at, ended_at, duration_s)
 ```
 
 Dados sao mantidos por 2 anos. Cleanup automatico roda diariamente via cron.
+
+## Cache
+
+A API publica e lida muito mais do que escrita: o cron grava a cada 3 minutos, mas
+cada visitante com a aba aberta consulta os mesmos endpoints em loop. O cache existe
+para que essas leituras repetidas nao virem `rows read` no D1 -- o limite do free tier
+e de 5.000.000/dia e e compartilhado por toda a conta Cloudflare.
+
+### Onde o cache fica, e onde nao fica
+
+`cache.ts` envolve apenas o handler `fetch`. **O cron nunca le do cache.** Isso nao e
+convencao, e estrutural: `scheduled()` chama `db.ts` direto e nunca passa por
+`withEdgeCache`. Importa porque `getLastNChecks` e `getOpenIncident` decidem quando
+abrir e fechar um incidente -- dado velho ali abre incidente fantasma e dispara
+notificacao falsa no Telegram.
+
+### Tres camadas
+
+| Camada | Escopo | Observacao |
+|---|---|---|
+| memoria do isolate | um isolate | funciona sempre; some quando o isolate recicla |
+| `caches.default` | um colo | **no-op em `*.workers.dev`** (ver abaixo) |
+| `Cache-Control` | navegador | o mais barato: nem chega na Cloudflare |
+
+### TTL por rota
+
+| Rota | borda | navegador | Por que |
+|---|---|---|---|
+| `/api/status` | 60s | 30s | cron escreve a cada 180s |
+| `/api/other-services` | 60s | 30s | idem |
+| `/api/incidents` | 300s | 120s | incidentes mudam em dias |
+| `/api/stats` | 600s | 300s | uptime de 24h+ mal se move |
+| `/api/history?period=24h` | 180s | 90s | casa 1:1 com a escrita |
+| `/api/history?period=7d` | 900s | 300s | = tamanho do bucket (15 min) |
+| `/api/history?period=30d` | 1800s | 600s | metade do bucket (60 min) |
+| `/api/history?period=90d` | 3600s | 900s | 1/3 do bucket (180 min) |
+| `/` (docs) | 86400s | 3600s | string constante no bundle |
+
+Rotas fora dessa lista **nao sao cacheadas**: `routeFor()` e whitelist, entao rota nova
+nasce sem cache e cachear e um ato deliberado. Respostas 4xx/5xx nunca entram no cache.
+Query params desconhecidos sao descartados na chave, senao um link com
+`?utm_source=...` criaria chaves infinitas, cada uma uma query nova no D1.
+
+### Invalidacao
+
+Tudo por TTL, nada por evento. `caches.default.delete()` chamado no cron limparia
+apenas o colo onde aquele cron rodou -- os outros continuariam servindo o valor antigo
+ate o TTL expirar de qualquer forma. Como a escrita e previsivel (a cada 180s, sempre
+pelo cron), TTL alinhado a cadencia e exato, nao aproximado.
+
+Para invalidar tudo de uma vez, suba `CACHE_VERSION` em `cache.ts` e faca deploy.
+
+### Como medir
+
+Toda resposta cacheavel traz `X-Cache: HIT-isolate | HIT-edge | MISS`:
+
+```bash
+curl -sI https://SEU-WORKER/api/stats | grep -i x-cache
+```
+
+Para a taxa de acerto no trafego real, agregando os logs estruturados:
+
+```bash
+npm run cache:stats          # ao vivo, via `wrangler tail`; Ctrl-C mostra o resumo
+
+# ou, a partir de um dump salvo:
+npx wrangler tail --format json > tail.log
+node scripts/cache-stats.mjs --stdin < tail.log
+```
+
+### Limitacao atual: `*.workers.dev`
+
+A Cloudflare **nao cacheia em subdominios `workers.dev`** -- `cache.put()` e no-op e
+`cache.match()` sempre erra, silenciosamente. Enquanto o worker estiver publicado ali,
+so as camadas 1 e 3 funcionam, e `cache:stats` vai reportar zero `HIT-edge`.
+
+Para ativar a camada de borda, publique num dominio proprio:
+
+```jsonc
+// wrangler.jsonc
+"routes": [{ "pattern": "api-XX.sigaacaiu.com", "custom_domain": true }]
+```
+
+e aponte `NEXT_PUBLIC_API_URL` do frontend pra ele. E aditivo: a URL `workers.dev`
+continua funcionando em paralelo.

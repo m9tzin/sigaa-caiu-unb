@@ -10,6 +10,7 @@ type Period = "24h" | "7d" | "30d";
 interface Props {
   layers?: Layers;
   histories?: Record<Period, HistoryResponse | null>;
+  onPeriodChange?: (period: Period) => void;
 }
 
 interface LayerDef {
@@ -95,7 +96,7 @@ function LayerRow({ def, info }: { def: LayerDef; info: LayerInfo | null }) {
   );
 }
 
-export function LayerDetails({ layers, histories }: Props) {
+export function LayerDetails({ layers, histories, onPeriodChange }: Props) {
   const [open, setOpen] = useState(false);
 
   if (!layers) return null;
@@ -128,7 +129,7 @@ export function LayerDetails({ layers, histories }: Props) {
 
           {histories && (
             <div className="border-t border-neutral-200 p-4">
-              <LayerResponseChart histories={histories} />
+              <LayerResponseChart histories={histories} onPeriodChange={onPeriodChange} />
             </div>
           )}
         </div>

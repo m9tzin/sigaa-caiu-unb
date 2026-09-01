@@ -8,6 +8,7 @@ import type {
   OtherServiceRow,
   RawOtherServiceRow,
 } from "./types";
+import { OTHER_SERVICES } from "./other-services";
 
 // --- Write operations ---
 
@@ -124,18 +125,23 @@ export async function getOtherServiceHistoryRaw(
 export async function getLatestOtherServiceChecks(
   db: D1Database
 ): Promise<OtherServiceRow[]> {
-  const result = await db
-    .prepare(
-      `SELECT t.* FROM other_service_checks t
-       INNER JOIN (
-         SELECT service_id, MAX(timestamp) AS max_ts
-         FROM other_service_checks
-         GROUP BY service_id
-       ) latest ON t.service_id = latest.service_id AND t.timestamp = latest.max_ts
-       ORDER BY t.service_id`
-    )
-    .all<OtherServiceRow>();
-  return result.results;
+  // One indexed seek per service instead of a GROUP BY over the whole table: the
+  // previous MAX(timestamp) form scanned every row of a 30-day window (~57k) to
+  // return one row per service. idx_other_service_checks(service_id, timestamp DESC)
+  // answers each of these with a single row. batch() keeps it to one round-trip.
+  const stmt = db.prepare(
+    `SELECT * FROM other_service_checks
+     WHERE service_id = ?
+     ORDER BY timestamp DESC LIMIT 1`
+  );
+
+  const results = await db.batch<OtherServiceRow>(
+    OTHER_SERVICES.map(svc => stmt.bind(svc.id))
+  );
+
+  // Services that have never been checked yield no row; callers already treat a
+  // missing service_id as "unknown".
+  return results.flatMap(r => r.results).sort((a, b) => a.service_id.localeCompare(b.service_id));
 }
 
 // --- Read operations ---

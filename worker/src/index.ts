@@ -5,6 +5,7 @@ import { checkAllOtherServices } from "./other-services";
 import { notifyIfNeeded } from "./notify";
 import { handleApiRequest } from "./api";
 import { withCors, handlePreflight } from "./cors";
+import { withEdgeCache } from "./cache";
 
 export default {
   async scheduled(
@@ -47,7 +48,7 @@ export default {
   async fetch(
     request: Request,
     env: Env,
-    _ctx: ExecutionContext
+    ctx: ExecutionContext
   ): Promise<Response> {
     const origin = "*";
 
@@ -65,7 +66,12 @@ export default {
       );
     }
 
-    const response = await handleApiRequest(request, env);
+    // CORS is applied after the cache so the stored copy stays header-free; the
+    // value is a constant "*", but keeping it outside means a future per-origin
+    // policy can't be served from one origin's cached entry to another.
+    const response = await withEdgeCache(request, ctx, () =>
+      handleApiRequest(request, env)
+    );
     return withCors(response, origin);
   },
 };
