@@ -20,6 +20,8 @@ type Period = "24h" | "7d" | "30d";
 
 interface Props {
   histories: Record<Period, HistoryResponse | null>;
+  /** Asks the page to fetch a period that has not been loaded yet. */
+  onPeriodChange?: (period: Period) => void;
 }
 
 function formatTime(timestamp: string, period: Period): string {
@@ -31,7 +33,7 @@ function formatTime(timestamp: string, period: Period): string {
   return date.toLocaleString("pt-BR", options);
 }
 
-export function ResponseTimeChart({ histories }: Props) {
+export function ResponseTimeChart({ histories, onPeriodChange }: Props) {
   const { theme } = useTheme();
   const isSigaa = theme === "sigaa";
   const [period, setPeriod] = useState<Period>("24h");
@@ -48,7 +50,10 @@ export function ResponseTimeChart({ histories }: Props) {
   const periodButtons = (["24h", "7d", "30d"] as Period[]).map((p) => (
     <button
       key={p}
-      onClick={() => setPeriod(p)}
+      onClick={() => {
+        setPeriod(p);
+        onPeriodChange?.(p);
+      }}
       className={`transition-colors ${
         isSigaa
           ? `px-2 py-0.5 text-xs border ${period === p ? "bg-sigaa-primary text-white border-sigaa-primary" : "bg-white text-sigaa-primary border-sigaa-border-blue hover:bg-sigaa-secondary"}`
@@ -59,7 +64,12 @@ export function ResponseTimeChart({ histories }: Props) {
     </button>
   ));
 
-  const chartContent = data.length === 0 ? (
+  // null means the period has not arrived yet; an empty array means it arrived empty.
+  const chartContent = history === null ? (
+    <div className={`h-48 flex items-center justify-center text-sm ${isSigaa ? "text-sigaa-muted" : "text-neutral-400"}`}>
+      Carregando...
+    </div>
+  ) : data.length === 0 ? (
     <div className={`h-48 flex items-center justify-center text-sm ${isSigaa ? "text-sigaa-muted" : "text-neutral-400"}`}>
       Sem dados para este periodo
     </div>

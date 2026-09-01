@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { HeroStatus } from "@/components/HeroStatus";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { LayerDetails } from "@/components/LayerDetails";
@@ -23,6 +23,10 @@ import type {
 type Period = "24h" | "7d" | "30d";
 type AllPeriod = Period | "90d";
 
+// The cron writes every 3 minutes, so polling faster only re-reads unchanged rows.
+const FAST_MS = 180_000; // status (+ other services): what makes the page feel live
+const SLOW_MS = 600_000; // stats, incidents, 24h chart: a 10-minute lag is invisible
+
 export default function Home() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
@@ -38,34 +42,95 @@ export default function Home() {
       ? null
       : null;
 
-  const loadData = useCallback(async () => {
-    try {
-      const [statusRes, statsRes, incidentsRes, h24, h7d, h30d, h90d] =
-        await Promise.all([
-          fetchStatus(),
-          fetchStats(),
-          fetchIncidents(),
-          fetchHistory("24h"),
-          fetchHistory("7d"),
-          fetchHistory("30d"),
-          fetchHistory("90d"),
-        ]);
+  const lastFast = useRef(0);
+  const lastSlow = useRef(0);
+  // Periods already fetched or in flight, so a repeated click costs nothing.
+  const requested = useRef(new Set<AllPeriod>());
 
-      setStatus(statusRes);
-      setStats(statsRes);
-      setIncidents(incidentsRes.incidents);
-      setHistories({ "24h": h24, "7d": h7d, "30d": h30d, "90d": h90d });
+  const loadFast = useCallback(async () => {
+    try {
+      setStatus(await fetchStatus());
       setError(false);
+      lastFast.current = Date.now();
     } catch {
       setError(true);
     }
   }, []);
 
+  const loadSlow = useCallback(async () => {
+    try {
+      const [statsRes, incidentsRes, h24] = await Promise.all([
+        fetchStats(),
+        fetchIncidents(),
+        fetchHistory("24h"),
+      ]);
+      setStats(statsRes);
+      setIncidents(incidentsRes.incidents);
+      setHistories((prev) => ({ ...prev, "24h": h24 }));
+      requested.current.add("24h");
+      lastSlow.current = Date.now();
+    } catch {
+      // Non-critical: the hero still renders from the fast tier, so a failure here
+      // should not flip the whole page into its error state.
+    }
+  }, []);
+
+  // Fetches a history period once, on demand. The charts call this when their period
+  // selector changes, so a visitor who never touches 7d/30d never pays for them.
+  const ensureHistory = useCallback(async (period: AllPeriod) => {
+    if (requested.current.has(period)) return;
+    requested.current.add(period);
+    try {
+      const res = await fetchHistory(period);
+      setHistories((prev) => ({ ...prev, [period]: res }));
+    } catch {
+      requested.current.delete(period); // let the next click retry
+    }
+  }, []);
+
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 60_000);
-    return () => clearInterval(interval);
-  }, [loadData]);
+    let fast: ReturnType<typeof setInterval> | undefined;
+    let slow: ReturnType<typeof setInterval> | undefined;
+
+    const stop = () => {
+      if (fast) clearInterval(fast);
+      if (slow) clearInterval(slow);
+      fast = undefined;
+      slow = undefined;
+    };
+
+    const start = () => {
+      stop();
+      // A hidden tab polls nothing. The previous 60s interval kept running in
+      // background tabs all night, which is what exhausted the D1 read quota.
+      if (document.visibilityState !== "visible") return;
+      fast = setInterval(loadFast, FAST_MS);
+      slow = setInterval(loadSlow, SLOW_MS);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        stop();
+        return;
+      }
+      // Back in view: catch up only on what actually went stale, so alt-tabbing
+      // does not turn into a burst of requests.
+      if (Date.now() - lastFast.current >= FAST_MS) loadFast();
+      if (Date.now() - lastSlow.current >= SLOW_MS) loadSlow();
+      start();
+    };
+
+    loadFast();
+    loadSlow();
+    ensureHistory("90d"); // daily uptime bars -- one new point per day
+    start();
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [loadFast, loadSlow, ensureHistory]);
 
   return (
     <>
@@ -91,8 +156,12 @@ export default function Home() {
           com 3 camadas: acesso ao servidor, pagina de login e formulario de autenticacao.
         </p>
         <UptimeBars history={histories["90d"]} stats={stats} incidents={incidents} />
-        <ResponseTimeChart histories={histories} />
-        <LayerDetails layers={status?.layers} histories={histories} />
+        <ResponseTimeChart histories={histories} onPeriodChange={ensureHistory} />
+        <LayerDetails
+          layers={status?.layers}
+          histories={histories}
+          onPeriodChange={ensureHistory}
+        />
         <IncidentsList incidents={incidents} />
 
         <footer className="text-center pt-8 text-xs text-neutral-400 flex flex-col items-center gap-3">
