@@ -93,7 +93,15 @@ function liveObjects(db) {
   try {
     stdout = execFileSync("npx", args, { cwd: workerDir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (error) {
-    console.error("erro ao consultar o banco:\n" + (error.stderr || error.message));
+    // wrangler splits its output between the two streams depending on what went wrong,
+    // and an auth failure can land entirely on stdout -- so print both, or the failure
+    // is unreadable in CI.
+    console.error("erro ao consultar o banco:");
+    console.error(`  comando: npx ${args.join(" ")}`);
+    console.error(`  status:  ${error.status ?? "?"}`);
+    if (error.stdout) console.error(`  stdout:\n${error.stdout}`);
+    if (error.stderr) console.error(`  stderr:\n${error.stderr}`);
+    if (!error.stdout && !error.stderr) console.error(`  ${error.message}`);
     process.exit(2);
   }
 
