@@ -9,6 +9,12 @@ import type {
   RawOtherServiceRow,
 } from "./types";
 import { OTHER_SERVICES } from "./other-services";
+import {
+  CHECK_GRANULARITIES,
+  SERVICE_GRANULARITIES,
+  checkRollupUpsertSql,
+  serviceRollupUpsertSql,
+} from "./rollup";
 
 /**
  * SQL expression for a time-window cutoff, rendered in the format timestamps are
@@ -40,36 +46,58 @@ export async function saveCheck(
   const skippedToNull = (s: LayerStatus): string | null =>
     s === "skipped" ? null : s;
 
-  await db
-    .prepare(
-      `INSERT INTO checks (
-         status, http_code, response_time_ms, error,
-         reachability_status, reachability_http, reachability_ms, reachability_error,
-         portal_status, portal_ms, portal_error,
-         login_form_status, login_form_ms, login_form_error,
-         login_e2e_status, login_e2e_ms, login_e2e_error
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      result.status,
-      result.httpCode,
-      result.responseTimeMs,
-      result.error,
-      skippedToNull(result.reachability.status),
-      result.reachability.httpCode,
-      result.reachability.responseTimeMs,
-      result.reachability.error,
-      skippedToNull(result.portal.status),
-      result.portal.responseTimeMs || null,
-      result.portal.error,
-      skippedToNull(result.loginForm.status),
-      result.loginForm.responseTimeMs || null,
-      result.loginForm.error,
-      skippedToNull(result.loginE2e.status),
-      result.loginE2e.responseTimeMs || null,
-      result.loginE2e.error
-    )
-    .run();
+  // The timestamp used to come from the column DEFAULT. It is bound explicitly now
+  // because the rollup upserts below have to land in the bucket that holds *this*
+  // check: reading 'now' again in a second statement can cross a bucket boundary.
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  const layerMs = [
+    result.reachability.responseTimeMs,
+    result.portal.responseTimeMs || null,
+    result.loginForm.responseTimeMs || null,
+    result.loginE2e.responseTimeMs || null,
+  ];
+
+  // One batch, so the check and its contribution to every rollup bucket either all
+  // land or none do. D1 batches are atomic, which is what makes the incremental
+  // upsert safe without a reconciliation pass on every tick.
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO checks (
+           timestamp, status, http_code, response_time_ms, error,
+           reachability_status, reachability_http, reachability_ms, reachability_error,
+           portal_status, portal_ms, portal_error,
+           login_form_status, login_form_ms, login_form_error,
+           login_e2e_status, login_e2e_ms, login_e2e_error
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        timestamp,
+        result.status,
+        result.httpCode,
+        result.responseTimeMs,
+        result.error,
+        skippedToNull(result.reachability.status),
+        result.reachability.httpCode,
+        result.reachability.responseTimeMs,
+        result.reachability.error,
+        skippedToNull(result.portal.status),
+        result.portal.responseTimeMs || null,
+        result.portal.error,
+        skippedToNull(result.loginForm.status),
+        result.loginForm.responseTimeMs || null,
+        result.loginForm.error,
+        skippedToNull(result.loginE2e.status),
+        result.loginE2e.responseTimeMs || null,
+        result.loginE2e.error
+      ),
+    ...CHECK_GRANULARITIES.map(g =>
+      db
+        .prepare(checkRollupUpsertSql(g))
+        .bind(timestamp, result.status, result.responseTimeMs, ...layerMs)
+    ),
+  ]);
 }
 
 export async function manageIncidents(
@@ -117,11 +145,25 @@ export async function saveOtherServiceChecks(
   results: OtherServiceCheckResult[]
 ): Promise<void> {
   if (results.length === 0) return;
-  const stmt = db.prepare(
-    `INSERT INTO other_service_checks (service_id, status, http_code, response_time_ms, error)
-     VALUES (?, ?, ?, ?, ?)`
+
+  // Bound for the same reason as in saveCheck: one clock reading for the row and
+  // for every bucket it feeds.
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  const insert = db.prepare(
+    `INSERT INTO other_service_checks (timestamp, service_id, status, http_code, response_time_ms, error)
+     VALUES (?, ?, ?, ?, ?, ?)`
   );
-  await db.batch(results.map(r => stmt.bind(r.serviceId, r.status, r.httpCode, r.responseTimeMs, r.error)));
+
+  await db.batch([
+    ...results.map(r =>
+      insert.bind(timestamp, r.serviceId, r.status, r.httpCode, r.responseTimeMs, r.error)
+    ),
+    ...SERVICE_GRANULARITIES.flatMap(g => {
+      const upsert = db.prepare(serviceRollupUpsertSql(g));
+      return results.map(r => upsert.bind(timestamp, r.serviceId, r.responseTimeMs));
+    }),
+  ]);
 }
 
 export async function getOtherServiceHistoryRaw(
