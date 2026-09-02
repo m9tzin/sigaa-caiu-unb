@@ -398,46 +398,68 @@ export async function getStats(
 ): Promise<Record<string, { uptimePercent: number; avgResponseMs: number; incidentCount: number }>> {
   const periods = ["24h", "7d", "30d", "90d"] as const;
 
-  // The loop this replaces awaited two queries per period -- eight round trips to the
-  // D1 primary for eight rows. The SQL is not the cost here: the 90-day aggregate, the
-  // heaviest of the eight, runs in about 24ms, while the endpoint took roughly 1.2s on
-  // a cache miss. batch() sends all eight as one request.
-  const checksStmt = db.prepare(
-    `SELECT
-       ROUND(100.0 * SUM(CASE WHEN status != 'offline' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2) AS uptime_pct,
-       ROUND(AVG(response_time_ms)) AS avg_ms
-     FROM checks
-     WHERE timestamp >= ${CUTOFF}`
-  );
-  const incidentsStmt = db.prepare(
-    `SELECT COUNT(*) as count FROM incidents
-     WHERE started_at >= ${CUTOFF}`
-  );
+  // This used to run eight statements that each scanned their raw window -- 60,750 rows
+  // per cache miss, half the account's entire daily D1 budget on one endpoint. The
+  // windows are now conditional sums over pre-aggregated buckets: one 90-row scan of the
+  // daily rollup covers 7d/30d/90d, and 24 hourly rows cover 24h.
+  //
+  // 7d/30d/90d snap to day boundaries, so the window is "the last N whole days plus
+  // today". Uptime moves in the rounding of the trailing hours only.
+  // Day-floored, not "now minus N days": the daily buckets sit at T00:00:00Z, so a
+  // cutoff carrying a time of day would drop the oldest bucket and make the window one
+  // day narrower than it reads. Floored, "-90 days" means 90 whole days plus today.
+  const dayCutoff = (days: number) =>
+    `strftime('%Y-%m-%dT00:00:00Z','now','-${days} days')`;
+  const windowed = (col: string, days: number) =>
+    `SUM(CASE WHEN bucket_start >= ${dayCutoff(days)} THEN ${col} ELSE 0 END)`;
 
-  // Checks first, then incidents, so a period's two rows sit at i and i + periods.length.
-  const rows = await db.batch<Record<string, unknown>>([
-    ...periods.map(period => checksStmt.bind(periodToInterval(period))),
-    ...periods.map(period => incidentsStmt.bind(periodToInterval(period))),
+  const [daily, hourly, incidents] = await db.batch<Record<string, number | null>>([
+    db.prepare(
+      `SELECT ${([7, 30, 90] as const)
+        .map(days => `${windowed("n", days)} AS n_${days}, ${windowed("n_offline", days)} AS off_${days}, ${windowed("sum_response_ms", days)} AS sum_${days}, ${windowed("n_response", days)} AS nr_${days}`)
+        .join(", ")}
+       FROM check_rollup
+       WHERE granularity = '1d' AND bucket_start >= ${dayCutoff(90)}`
+    ),
+    db.prepare(
+      `SELECT SUM(n) AS n, SUM(n_offline) AS off, SUM(sum_response_ms) AS sum, SUM(n_response) AS nr
+       FROM check_rollup
+       WHERE granularity = '1h'
+         AND bucket_start >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-24 hours')`
+    ),
+    // Incidents stay on the raw table: idx_incidents_started already answers this and
+    // the measured cost was ~0. One statement instead of four, same trick.
+    db.prepare(
+      `SELECT
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-24 hours') THEN 1 ELSE 0 END) AS c_24h,
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')   THEN 1 ELSE 0 END) AS c_7d,
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')  THEN 1 ELSE 0 END) AS c_30d,
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-90 days')  THEN 1 ELSE 0 END) AS c_90d
+       FROM incidents
+       WHERE started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-90 days')`
+    ),
   ]);
+
+  const day = daily.results[0] ?? {};
+  const hour = hourly.results[0] ?? {};
+  const inc = incidents.results[0] ?? {};
 
   const stats: Record<string, { uptimePercent: number; avgResponseMs: number; incidentCount: number }> = {};
 
-  periods.forEach((period, i) => {
-    // Both are aggregates over a possibly empty window, so the row always exists but
-    // its columns can be NULL -- the fallbacks below carry that case, as before.
-    const checks = rows[i].results[0] as
-      | { uptime_pct: number | null; avg_ms: number | null }
-      | undefined;
-    const incidents = rows[i + periods.length].results[0] as
-      | { count: number | null }
-      | undefined;
+  for (const period of periods) {
+    const suffix = period === "24h" ? null : period.replace("d", "");
+    const n = Number((suffix ? day[`n_${suffix}`] : hour.n) ?? 0);
+    const off = Number((suffix ? day[`off_${suffix}`] : hour.off) ?? 0);
+    const sum = Number((suffix ? day[`sum_${suffix}`] : hour.sum) ?? 0);
+    const nr = Number((suffix ? day[`nr_${suffix}`] : hour.nr) ?? 0);
 
     stats[period] = {
-      uptimePercent: checks?.uptime_pct ?? 100,
-      avgResponseMs: checks?.avg_ms ?? 0,
-      incidentCount: incidents?.count ?? 0,
+      // "degraded" counts as up, matching the status != 'offline' the raw query used.
+      uptimePercent: n === 0 ? 100 : Math.round((100 * (n - off)) / n * 100) / 100,
+      avgResponseMs: nr === 0 ? 0 : Math.round(sum / nr),
+      incidentCount: Number(inc[`c_${period}`] ?? 0),
     };
-  });
+  }
 
   return stats;
 }
