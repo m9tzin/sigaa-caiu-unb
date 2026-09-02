@@ -5,17 +5,17 @@
 // incidents), so keeping the cache here makes that separation structural instead of
 // something every future caller has to remember.
 //
-// Three tiers, because the worker currently runs on a *.workers.dev subdomain:
+// Three tiers:
 //
-//   1. isolate memory  — works everywhere, including workers.dev. Survives as long as
-//                        the isolate does, which under steady traffic is minutes.
-//   2. caches.default  — the real edge cache, shared by every isolate in a colo.
-//                        Cloudflare does NOT cache on *.workers.dev: put() is a no-op
-//                        and match() always misses, silently. This tier stays dormant
-//                        until the worker is served from a custom domain, then starts
-//                        working with no code change.
-//   3. Cache-Control   — browser cache. Works everywhere and costs the worker nothing:
-//                        a hit here never reaches Cloudflare at all.
+//   1. isolate memory  — answers first and skips even the async cache lookup. Lives as
+//                        long as the isolate does, which under steady traffic is
+//                        minutes.
+//   2. caches.default  — the edge cache, shared by every isolate in a colo. Verified
+//                        serving X-Cache: HIT-edge on the *.workers.dev hostname. It
+//                        is per colo and evictable under memory pressure, so it lowers
+//                        the average cost of a request rather than capping it.
+//   3. Cache-Control   — browser cache. Costs the worker nothing at all: a hit here
+//                        never reaches Cloudflare.
 
 const CACHE_VERSION = "v1";
 

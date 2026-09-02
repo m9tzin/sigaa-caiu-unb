@@ -112,13 +112,15 @@ function table() {
   );
   console.log(`\nrows lidas de fato: ${totals.spent.toLocaleString("pt-BR")}`);
 
-  // The edge tier is a no-op on *.workers.dev; say so rather than let a 0 look like
-  // a hit-rate problem.
+  // A low HIT-edge is normal: tier 1 answers before the edge is consulted, so the
+  // edge only shows up after an isolate recycles. It is only worth a look when the
+  // isolate tier is not absorbing the traffic either.
   const edgeHits = routes.reduce((a, r) => a + stats.get(r)["HIT-edge"], 0);
-  if (totals.req > 20 && edgeHits === 0) {
+  const isolateHits = routes.reduce((a, r) => a + stats.get(r)["HIT-isolate"], 0);
+  if (totals.req > 20 && edgeHits === 0 && isolateHits < totals.req / 2) {
     console.log(
-      "\naviso: zero HIT-edge. Esperado em *.workers.dev, onde a Cloudflare nao\n" +
-      "cacheia. Num dominio proprio esse numero deve subir."
+      "\naviso: zero HIT-edge com poucos HIT-isolate. Confira se as respostas estao\n" +
+      "saindo com Cache-Control e status 200 -- so essas entram no cache."
     );
   }
   console.log();

@@ -91,7 +91,7 @@ notificacao falsa no Telegram.
 | Camada | Escopo | Observacao |
 |---|---|---|
 | memoria do isolate | um isolate | funciona sempre; some quando o isolate recicla |
-| `caches.default` | um colo | **no-op em `*.workers.dev`** (ver abaixo) |
+| `caches.default` | um colo | compartilhado entre isolates; sujeito a evicao |
 | `Cache-Control` | navegador | o mais barato: nem chega na Cloudflare |
 
 ### TTL por rota
@@ -130,6 +130,10 @@ Toda resposta cacheavel traz `X-Cache: HIT-isolate | HIT-edge | MISS`:
 curl -sI https://SEU-WORKER/api/stats | grep -i x-cache
 ```
 
+`HIT-isolate` costuma dominar, porque a camada 1 responde antes de consultar a borda;
+`HIT-edge` aparece quando o isolate reciclou ou quando outro isolate do mesmo colo ja
+tinha a entrada.
+
 Para a taxa de acerto no trafego real, agregando os logs estruturados:
 
 ```bash
@@ -140,18 +144,16 @@ npx wrangler tail --format json > tail.log
 node scripts/cache-stats.mjs --stdin < tail.log
 ```
 
-### Limitacao atual: `*.workers.dev`
+### Dominio proprio
 
-A Cloudflare **nao cacheia em subdominios `workers.dev`** -- `cache.put()` e no-op e
-`cache.match()` sempre erra, silenciosamente. Enquanto o worker estiver publicado ali,
-so as camadas 1 e 3 funcionam, e `cache:stats` vai reportar zero `HIT-edge`.
-
-Para ativar a camada de borda, publique num dominio proprio:
+Nao e necessario para o cache: `caches.default` foi verificado funcionando na URL
+`*.workers.dev`, servindo `X-Cache: HIT-edge`. Um dominio proprio continua util por
+outros motivos (URL estavel, independente do subdominio da conta), e nesse caso basta:
 
 ```jsonc
 // wrangler.jsonc
 "routes": [{ "pattern": "api-XX.sigaacaiu.com", "custom_domain": true }]
 ```
 
-e aponte `NEXT_PUBLIC_API_URL` do frontend pra ele. E aditivo: a URL `workers.dev`
+e apontar `NEXT_PUBLIC_API_URL` do frontend pra ele. E aditivo: a URL `workers.dev`
 continua funcionando em paralelo.
