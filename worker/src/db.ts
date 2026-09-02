@@ -12,6 +12,7 @@ import { OTHER_SERVICES } from "./other-services";
 import {
   CHECK_GRANULARITIES,
   SERVICE_GRANULARITIES,
+  bucketExpr,
   checkRollupUpsertSql,
   serviceRollupUpsertSql,
 } from "./rollup";
@@ -137,7 +138,97 @@ export async function cleanupOldChecks(db: D1Database): Promise<void> {
   await db.batch([
     db.prepare(`DELETE FROM checks WHERE timestamp < ${CUTOFF}`).bind("-730 days"),
     db.prepare(`DELETE FROM other_service_checks WHERE timestamp < ${CUTOFF}`).bind("-30 days"),
+    // Margin over what the routes actually read: history stops at 90 days, /api/stats
+    // at 90 daily buckets, the other-services chart at 30 days.
+    db
+      .prepare(
+        `DELETE FROM check_rollup
+         WHERE granularity IN ('15m','1h') AND bucket_start < ${CUTOFF}`
+      )
+      .bind("-100 days"),
+    db
+      .prepare(`DELETE FROM check_rollup WHERE granularity = '1d' AND bucket_start < ${CUTOFF}`)
+      .bind("-400 days"),
+    db.prepare(`DELETE FROM other_service_rollup WHERE bucket_start < ${CUTOFF}`).bind("-40 days"),
   ]);
+}
+
+/** True when the rollup has never been populated -- the deploy-time bootstrap signal. */
+export async function rollupIsEmpty(db: D1Database): Promise<boolean> {
+  const row = await db.prepare(`SELECT 1 FROM check_rollup LIMIT 1`).first();
+  return row === null;
+}
+
+/**
+ * Rebuilds rollup buckets from the raw tables.
+ *
+ * Two callers, one body: the daily pass repairs the trailing edge ("-2 days"), and the
+ * first tick after a deploy passes null to backfill the whole history. Making the
+ * backfill the same code as the repair means the backfill is exercised in production
+ * every day instead of being a one-shot script nobody runs twice.
+ *
+ * DO UPDATE *replaces* here, where the write path adds. That is what makes this safe to
+ * run against a live worker: re-running it, or overlapping it with incremental upserts,
+ * converges instead of double-counting.
+ */
+export async function recomputeRollup(
+  db: D1Database,
+  since: string | null
+): Promise<void> {
+  const window = since === null ? "" : `WHERE timestamp >= ${CUTOFF}`;
+  const bind = (stmt: D1PreparedStatement) => (since === null ? stmt : stmt.bind(since));
+
+  const checkCols = [
+    "n", "n_offline", "n_degraded", "sum_response_ms", "n_response",
+    "sum_reachability_ms", "n_reachability", "sum_portal_ms", "n_portal",
+    "sum_login_form_ms", "n_login_form", "sum_login_e2e_ms", "n_login_e2e",
+  ];
+  const layerAggs = ["reachability", "portal", "login_form", "login_e2e"]
+    .map(l => `COALESCE(SUM(${l}_ms), 0), COUNT(${l}_ms)`)
+    .join(", ");
+
+  const checkStmts = CHECK_GRANULARITIES.map(g =>
+    bind(
+      db.prepare(
+        `INSERT INTO check_rollup (granularity, bucket_start, ${checkCols.join(", ")})
+         SELECT '${g}',
+                ${bucketExpr(g, "timestamp")},
+                COUNT(*),
+                SUM(CASE WHEN status = 'offline'  THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'degraded' THEN 1 ELSE 0 END),
+                COALESCE(SUM(response_time_ms), 0), COUNT(response_time_ms),
+                ${layerAggs}
+         FROM checks
+         ${window}
+         GROUP BY 2
+         ON CONFLICT(granularity, bucket_start) DO UPDATE SET
+           ${checkCols.map(c => `${c} = excluded.${c}`).join(", ")}`
+      )
+    )
+  );
+
+  const serviceStmts = SERVICE_GRANULARITIES.map(g =>
+    bind(
+      db.prepare(
+        `INSERT INTO other_service_rollup (granularity, bucket_start, service_id, n, sum_response_ms, n_response)
+         SELECT '${g}',
+                ${bucketExpr(g, "timestamp")},
+                service_id,
+                COUNT(*),
+                COALESCE(SUM(response_time_ms), 0),
+                COUNT(response_time_ms)
+         FROM other_service_checks
+         ${window}
+         GROUP BY 2, 3
+         ON CONFLICT(granularity, bucket_start, service_id) DO UPDATE SET
+           n = excluded.n,
+           sum_response_ms = excluded.sum_response_ms,
+           n_response      = excluded.n_response`
+      )
+    )
+  );
+
+  await db.batch([...checkStmts, ...serviceStmts]);
 }
 
 export async function saveOtherServiceChecks(

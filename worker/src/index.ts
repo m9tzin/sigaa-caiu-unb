@@ -1,6 +1,14 @@
 import type { Env } from "./types";
 import { performHealthCheck } from "./health";
-import { saveCheck, getLastNChecks, manageIncidents, cleanupOldChecks, saveOtherServiceChecks } from "./db";
+import {
+  saveCheck,
+  getLastNChecks,
+  manageIncidents,
+  cleanupOldChecks,
+  saveOtherServiceChecks,
+  rollupIsEmpty,
+  recomputeRollup,
+} from "./db";
 import { checkAllOtherServices } from "./other-services";
 import { notifyIfNeeded } from "./notify";
 import { handleApiRequest } from "./api";
@@ -39,8 +47,13 @@ export default {
     await manageIncidents(env.DB, result, lastChecks);
     ctx.waitUntil(notifyIfNeeded(env, result, lastChecks));
 
-    // Cleanup old data once per day
-    if (now.getUTCHours() === 3 && minute < 5) {
+    // The rollup is empty exactly once: on the first tick after the tables ship. That
+    // tick backfills the whole history; every later day only repairs the trailing edge.
+    // Same function, so the backfill path is not dead code between deploys.
+    if (await rollupIsEmpty(env.DB)) {
+      ctx.waitUntil(recomputeRollup(env.DB, null));
+    } else if (now.getUTCHours() === 3 && minute < 5) {
+      ctx.waitUntil(recomputeRollup(env.DB, "-2 days"));
       ctx.waitUntil(cleanupOldChecks(env.DB));
     }
   },
