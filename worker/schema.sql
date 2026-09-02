@@ -63,9 +63,10 @@ CREATE TABLE IF NOT EXISTS other_service_checks (
 
 CREATE INDEX IF NOT EXISTS idx_other_service_checks ON other_service_checks(service_id, timestamp DESC);
 
--- getOtherServiceHistoryRaw filters on timestamp alone, with no service_id, so the
--- index above -- which leads with service_id -- cannot answer it and the query
--- degrades into a full table scan. This one covers the time window.
+-- getOtherServiceHistory's 24h branch filters on timestamp alone, with no service_id,
+-- so the index above -- which leads with service_id -- cannot answer it and the query
+-- degrades into a full table scan. This one covers the time window. (7d/30d read
+-- other_service_rollup instead and do not need it.)
 CREATE INDEX IF NOT EXISTS idx_other_service_checks_ts ON other_service_checks(timestamp);
 
 -- Pre-aggregated buckets. The aggregate routes used to scan their whole raw window on
@@ -82,6 +83,13 @@ CREATE INDEX IF NOT EXISTS idx_other_service_checks_ts ON other_service_checks(t
 -- bucket_start is stored in the same ISO format as checks.timestamp at every
 -- granularity, '1d' included (it aligns on T00:00:00Z). See the CUTOFF comment in
 -- src/db.ts for why a datetime()-shaped value would compare wrong.
+--
+-- Both tables are WITHOUT ROWID: the PRIMARY KEY is non-integer, so a normal rowid
+-- table would build a separate sqlite_autoindex_* to enforce it and every read pays an
+-- index seek plus a table lookup through the rowid. Every access here is a PK-range
+-- scan (by granularity + bucket_start, or + service_id) with no secondary index, which
+-- is exactly the shape WITHOUT ROWID targets: one clustered structure instead of two,
+-- roughly half the rows touched per read.
 CREATE TABLE IF NOT EXISTS check_rollup (
   granularity         TEXT    NOT NULL CHECK (granularity IN ('15m','1h','1d')),
   bucket_start        TEXT    NOT NULL,
@@ -99,7 +107,7 @@ CREATE TABLE IF NOT EXISTS check_rollup (
   sum_login_e2e_ms    INTEGER NOT NULL DEFAULT 0,
   n_login_e2e         INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (granularity, bucket_start)
-);
+) WITHOUT ROWID;
 
 -- Same idea for the auxiliary services, minus the status counters: the route only ever
 -- renders response times (see pivotOtherServiceRows in src/api.ts). No '1d' row -- the
@@ -112,4 +120,4 @@ CREATE TABLE IF NOT EXISTS other_service_rollup (
   sum_response_ms INTEGER NOT NULL DEFAULT 0,
   n_response      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (granularity, bucket_start, service_id)
-);
+) WITHOUT ROWID;
