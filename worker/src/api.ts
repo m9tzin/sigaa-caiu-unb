@@ -157,8 +157,8 @@ function pivotOtherServiceRows(
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([ts, b]) => ({
       timestamp: ts,
-      matriculaweb_ms: b.matriculaweb_ms ? Math.round(b.matriculaweb_ms.sum / b.matriculaweb_ms.count) : null,
-      bce_ms: b.bce_ms ? Math.round(b.bce_ms.sum / b.bce_ms.count) : null,
+      matriculaweb_ms: b.matriculaweb_ms && b.matriculaweb_ms.count > 0 ? Math.round(b.matriculaweb_ms.sum / b.matriculaweb_ms.count) : null,
+      bce_ms: b.bce_ms && b.bce_ms.count > 0 ? Math.round(b.bce_ms.sum / b.bce_ms.count) : null,
     }));
 }
 
