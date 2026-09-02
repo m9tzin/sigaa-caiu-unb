@@ -338,57 +338,68 @@ export async function getHistory(
   db: D1Database,
   period: string
 ): Promise<CheckRow[]> {
-  const interval = periodToInterval(period);
-
   if (period === "24h") {
-    // Return all checks for 24h (max ~480 rows)
+    // Raw 3-minute points, the cron's own cadence -- there is nothing to downsample.
     const result = await db
       .prepare(
         `SELECT * FROM checks
          WHERE timestamp >= ${CUTOFF}
          ORDER BY timestamp ASC`
       )
-      .bind(interval)
+      .bind(periodToInterval(period))
       .all<CheckRow>();
     return result.results;
   }
 
-  // For 7d/30d/90d, downsample by grouping into time buckets
-  const bucketMinutes = period === "7d" ? 15 : period === "30d" ? 60 : 180;
+  // 7d wants 15-minute points and 30d wants hourly ones, which the rollup stores
+  // directly; 90d wants 3-hour points, built by grouping three hourly buckets. Reading
+  // the coarser granularity is what keeps 90d at 2,160 rows instead of 87,879.
+  const granularity = period === "7d" ? "15m" : "1h";
+  const groupHours = period === "90d" ? 3 : 0;
+
+  const bucketKey = groupHours
+    ? `strftime('%Y-%m-%dT', bucket_start) || printf('%02d:00:00Z', (CAST(strftime('%H', bucket_start) AS INTEGER) / ${groupHours}) * ${groupHours})`
+    : `bucket_start`;
+
+  // A layer that never ran inside the group has n = 0. It has to come back NULL, the
+  // way AVG() returned NULL over an all-NULL window: a 0 would draw a floor-hugging
+  // line in LayerResponseChart instead of a gap.
+  const avg = (col: string, n: string) =>
+    `CASE WHEN SUM(${n}) = 0 THEN NULL ELSE ROUND(CAST(SUM(${col}) AS REAL) / SUM(${n})) END`;
 
   const result = await db
     .prepare(
       `SELECT
-         id,
-         MIN(timestamp) as timestamp,
+         CAST(strftime('%s', MIN(bucket_start)) AS INTEGER) as id,
+         MIN(bucket_start) as timestamp,
          CASE
-           WHEN SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END) > 0 THEN 'offline'
-           WHEN SUM(CASE WHEN status = 'degraded' THEN 1 ELSE 0 END) > 0 THEN 'degraded'
+           WHEN SUM(n_offline)  > 0 THEN 'offline'
+           WHEN SUM(n_degraded) > 0 THEN 'degraded'
            ELSE 'online'
          END as status,
-         ROUND(AVG(http_code)) as http_code,
-         ROUND(AVG(response_time_ms)) as response_time_ms,
+         NULL as http_code,
+         ${avg("sum_response_ms", "n_response")} as response_time_ms,
          NULL as error,
          NULL as reachability_status,
-         ROUND(AVG(reachability_http)) as reachability_http,
-         ROUND(AVG(reachability_ms)) as reachability_ms,
+         NULL as reachability_http,
+         ${avg("sum_reachability_ms", "n_reachability")} as reachability_ms,
          NULL as reachability_error,
          NULL as portal_status,
-         ROUND(AVG(portal_ms)) as portal_ms,
+         ${avg("sum_portal_ms", "n_portal")} as portal_ms,
          NULL as portal_error,
          NULL as login_form_status,
-         ROUND(AVG(login_form_ms)) as login_form_ms,
+         ${avg("sum_login_form_ms", "n_login_form")} as login_form_ms,
          NULL as login_form_error,
          NULL as login_e2e_status,
-         ROUND(AVG(login_e2e_ms)) as login_e2e_ms,
+         ${avg("sum_login_e2e_ms", "n_login_e2e")} as login_e2e_ms,
          NULL as login_e2e_error
-       FROM checks
-       WHERE timestamp >= ${CUTOFF}
-       GROUP BY strftime('%Y-%m-%dT%H:', timestamp) ||
-         printf('%02d', (CAST(strftime('%M', timestamp) AS INTEGER) / ${bucketMinutes}) * ${bucketMinutes})
+       FROM check_rollup
+       WHERE granularity = '${granularity}'
+         AND bucket_start >= ${CUTOFF}
+       GROUP BY ${bucketKey}
        ORDER BY timestamp ASC`
     )
-    .bind(interval)
+    .bind(periodToInterval(period))
     .all<CheckRow>();
   return result.results;
 }
