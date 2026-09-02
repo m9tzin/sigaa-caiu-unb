@@ -175,7 +175,22 @@ export async function recomputeRollup(
   db: D1Database,
   since: string | null
 ): Promise<void> {
-  const window = since === null ? "" : `WHERE timestamp >= ${CUTOFF}`;
+  // A numbered parameter, not the bare "?" that CUTOFF's other callers bind at most
+  // once each: bucketExpr("15m", x) references x twice (the hour part and the minute
+  // part), so the same bound value has to land in both spots within one WHERE clause.
+  // Defined locally rather than changing CUTOFF itself -- other callers depend on its
+  // current shape.
+  //
+  // The cutoff is floored to each granularity's own bucket boundary (not compared
+  // against a raw wall-clock instant) so a bucket is either wholly inside the window or
+  // wholly outside it. A bucket split across the boundary would recompute from only its
+  // post-cutoff rows, and because DO UPDATE below *replaces*, that would silently
+  // overwrite a previously-correct bucket with an undercounted one -- permanently, since
+  // the next day's cutoff moves past it and it never gets revisited. The comparison
+  // stays "timestamp >= <floored constant>", with the raw column on the left, so
+  // idx_checks_timestamp still answers it; flooring the column itself on the left would
+  // turn this into a full table scan.
+  const cutoffExpr = `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)`;
   const bind = (stmt: D1PreparedStatement) => (since === null ? stmt : stmt.bind(since));
 
   const checkCols = [
@@ -187,8 +202,9 @@ export async function recomputeRollup(
     .map(l => `COALESCE(SUM(${l}_ms), 0), COUNT(${l}_ms)`)
     .join(", ");
 
-  const checkStmts = CHECK_GRANULARITIES.map(g =>
-    bind(
+  const checkStmts = CHECK_GRANULARITIES.map(g => {
+    const window = since === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
+    return bind(
       db.prepare(
         `INSERT INTO check_rollup (granularity, bucket_start, ${checkCols.join(", ")})
          SELECT '${g}',
@@ -204,11 +220,12 @@ export async function recomputeRollup(
          ON CONFLICT(granularity, bucket_start) DO UPDATE SET
            ${checkCols.map(c => `${c} = excluded.${c}`).join(", ")}`
       )
-    )
-  );
+    );
+  });
 
-  const serviceStmts = SERVICE_GRANULARITIES.map(g =>
-    bind(
+  const serviceStmts = SERVICE_GRANULARITIES.map(g => {
+    const window = since === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
+    return bind(
       db.prepare(
         `INSERT INTO other_service_rollup (granularity, bucket_start, service_id, n, sum_response_ms, n_response)
          SELECT '${g}',
@@ -225,8 +242,8 @@ export async function recomputeRollup(
            sum_response_ms = excluded.sum_response_ms,
            n_response      = excluded.n_response`
       )
-    )
-  );
+    );
+  });
 
   await db.batch([...checkStmts, ...serviceStmts]);
 }
