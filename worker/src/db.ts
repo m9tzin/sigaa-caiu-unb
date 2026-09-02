@@ -247,36 +247,47 @@ export async function getStats(
   db: D1Database
 ): Promise<Record<string, { uptimePercent: number; avgResponseMs: number; incidentCount: number }>> {
   const periods = ["24h", "7d", "30d", "90d"] as const;
+
+  // The loop this replaces awaited two queries per period -- eight round trips to the
+  // D1 primary for eight rows. The SQL is not the cost here: the 90-day aggregate, the
+  // heaviest of the eight, runs in about 24ms, while the endpoint took roughly 1.2s on
+  // a cache miss. batch() sends all eight as one request.
+  const checksStmt = db.prepare(
+    `SELECT
+       ROUND(100.0 * SUM(CASE WHEN status != 'offline' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2) AS uptime_pct,
+       ROUND(AVG(response_time_ms)) AS avg_ms
+     FROM checks
+     WHERE timestamp >= ${CUTOFF}`
+  );
+  const incidentsStmt = db.prepare(
+    `SELECT COUNT(*) as count FROM incidents
+     WHERE started_at >= ${CUTOFF}`
+  );
+
+  // Checks first, then incidents, so a period's two rows sit at i and i + periods.length.
+  const rows = await db.batch<Record<string, unknown>>([
+    ...periods.map(period => checksStmt.bind(periodToInterval(period))),
+    ...periods.map(period => incidentsStmt.bind(periodToInterval(period))),
+  ]);
+
   const stats: Record<string, { uptimePercent: number; avgResponseMs: number; incidentCount: number }> = {};
 
-  for (const period of periods) {
-    const interval = periodToInterval(period);
-
-    const checksResult = await db
-      .prepare(
-        `SELECT
-           ROUND(100.0 * SUM(CASE WHEN status != 'offline' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2) AS uptime_pct,
-           ROUND(AVG(response_time_ms)) AS avg_ms
-         FROM checks
-         WHERE timestamp >= ${CUTOFF}`
-      )
-      .bind(interval)
-      .first<{ uptime_pct: number; avg_ms: number }>();
-
-    const incidentResult = await db
-      .prepare(
-        `SELECT COUNT(*) as count FROM incidents
-         WHERE started_at >= ${CUTOFF}`
-      )
-      .bind(interval)
-      .first<{ count: number }>();
+  periods.forEach((period, i) => {
+    // Both are aggregates over a possibly empty window, so the row always exists but
+    // its columns can be NULL -- the fallbacks below carry that case, as before.
+    const checks = rows[i].results[0] as
+      | { uptime_pct: number | null; avg_ms: number | null }
+      | undefined;
+    const incidents = rows[i + periods.length].results[0] as
+      | { count: number | null }
+      | undefined;
 
     stats[period] = {
-      uptimePercent: checksResult?.uptime_pct ?? 100,
-      avgResponseMs: checksResult?.avg_ms ?? 0,
-      incidentCount: incidentResult?.count ?? 0,
+      uptimePercent: checks?.uptime_pct ?? 100,
+      avgResponseMs: checks?.avg_ms ?? 0,
+      incidentCount: incidents?.count ?? 0,
     };
-  }
+  });
 
   return stats;
 }
@@ -284,48 +295,60 @@ export async function getStats(
 export async function getLastKnownLayers(
   db: D1Database
 ): Promise<LastKnownLayers> {
-  // Most recent non-null value for each layer, independent of the others.
-  // One round-trip query per layer keeps the SQL simple; SQLite is local.
-  const latest = async <T>(selectCols: string, whereNonNull: string): Promise<T | null> =>
-    db
-      .prepare(
-        `SELECT ${selectCols}, timestamp FROM checks
-         WHERE ${whereNonNull} IS NOT NULL
-         ORDER BY timestamp DESC LIMIT 1`
-      )
-      .first<T>();
+  // The four layers are independent, so the sequence of awaits this replaces bought
+  // nothing but latency: four round trips to the D1 primary to fetch four rows. The
+  // comment that used to sit here justified the loop with "SQLite is local" -- it is
+  // not. The worker runs at the edge and the primary sits in one region, so a round
+  // trip costs tens of milliseconds against SQL that costs a fraction of one.
+  //
+  // Each layer needs its own predicate and column list, so this stays four statements;
+  // batch() just sends them as a single request. The partial indexes in schema.sql
+  // answer each one from a single row.
+  const layerStmt = (selectCols: string, whereNonNull: string) =>
+    db.prepare(
+      `SELECT ${selectCols}, timestamp FROM checks
+       WHERE ${whereNonNull} IS NOT NULL
+       ORDER BY timestamp DESC LIMIT 1`
+    );
 
-  const reachability = await latest<{
+  const [reachRow, portalRow, formRow, e2eRow] = await db.batch<Record<string, unknown>>([
+    layerStmt(
+      "reachability_status, reachability_http, reachability_ms, reachability_error",
+      "reachability_status"
+    ),
+    layerStmt("portal_status, portal_ms, portal_error", "portal_status"),
+    layerStmt("login_form_status, login_form_ms, login_form_error", "login_form_status"),
+    layerStmt("login_e2e_status, login_e2e_ms, login_e2e_error", "login_e2e_status"),
+  ]);
+
+  const reachability = (reachRow.results[0] ?? null) as {
     reachability_status: LayerStatus;
     reachability_http: number | null;
     reachability_ms: number | null;
     reachability_error: string | null;
     timestamp: string;
-  }>(
-    "reachability_status, reachability_http, reachability_ms, reachability_error",
-    "reachability_status"
-  );
+  } | null;
 
-  const portal = await latest<{
+  const portal = (portalRow.results[0] ?? null) as {
     portal_status: LayerStatus;
     portal_ms: number | null;
     portal_error: string | null;
     timestamp: string;
-  }>("portal_status, portal_ms, portal_error", "portal_status");
+  } | null;
 
-  const loginForm = await latest<{
+  const loginForm = (formRow.results[0] ?? null) as {
     login_form_status: LayerStatus;
     login_form_ms: number | null;
     login_form_error: string | null;
     timestamp: string;
-  }>("login_form_status, login_form_ms, login_form_error", "login_form_status");
+  } | null;
 
-  const loginE2e = await latest<{
+  const loginE2e = (e2eRow.results[0] ?? null) as {
     login_e2e_status: LayerStatus;
     login_e2e_ms: number | null;
     login_e2e_error: string | null;
     timestamp: string;
-  }>("login_e2e_status, login_e2e_ms, login_e2e_error", "login_e2e_status");
+  } | null;
 
   return {
     reachability: reachability

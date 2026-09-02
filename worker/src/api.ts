@@ -60,8 +60,12 @@ export async function handleApiRequest(
 }
 
 async function handleStatus(env: Env): Promise<Response> {
-  const lastChecks = await getLastNChecks(env.DB, 5);
-  const openIncident = await getOpenIncident(env.DB);
+  // Independent of each other, and both are needed on every path through this
+  // handler, so there is no reason to await them in sequence.
+  const [lastChecks, openIncident] = await Promise.all([
+    getLastNChecks(env.DB, 5),
+    getOpenIncident(env.DB),
+  ]);
 
   if (lastChecks.length === 0) {
     return json({
