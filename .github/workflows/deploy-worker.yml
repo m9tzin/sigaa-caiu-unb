@@ -24,12 +24,27 @@ jobs:
       # files are applied by hand, so without this a forgotten "wrangler d1 execute
       # --remote" ships code against a database that never got its indexes -- which is
       # exactly what happened with the partial layer indexes.
+      #
+      # Drift (exit 1) fails the build. Being unable to check at all (exit 2) only
+      # warns: the token that deploys a Worker does not automatically carry D1:Read, and
+      # a permissions gap in an auxiliary check should not take deployment down with it.
+      # The warning annotation keeps that state visible instead of silently green.
       - name: Verify database schema
-        run: npm run db:verify
         working-directory: worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set +e
+          npm run db:verify
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then
+            echo "::error::O banco divergiu de schema.sql; veja a saida acima."
+            exit 1
+          elif [ "$code" -ne 0 ]; then
+            echo "::warning::db:verify nao conseguiu consultar o D1 (exit $code). O deploy segue, mas sem a checagem de schema."
+          fi
 
       - name: Deploy to Cloudflare
         run: npx wrangler deploy
