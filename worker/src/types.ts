@@ -101,10 +101,16 @@ export interface OtherServiceRow {
   error: string | null;
 }
 
-export interface RawOtherServiceRow {
+/**
+ * One row feeding the other-services chart. The 24h path reads raw checks (n_response
+ * is 1 per row); 7d and 30d read pre-aggregated buckets. Carrying sum and count instead
+ * of a single value lets one pivot serve both.
+ */
+export interface OtherServiceHistoryRow {
   timestamp: string;
   service_id: string;
-  response_time_ms: number;
+  sum_response_ms: number;
+  n_response: number;
 }
 
 export interface Env {

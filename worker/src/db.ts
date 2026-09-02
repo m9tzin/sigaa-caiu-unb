@@ -5,8 +5,8 @@ import type {
   LastKnownLayers,
   LayerStatus,
   OtherServiceCheckResult,
+  OtherServiceHistoryRow,
   OtherServiceRow,
-  RawOtherServiceRow,
 } from "./types";
 import { OTHER_SERVICES } from "./other-services";
 import {
@@ -274,20 +274,39 @@ export async function saveOtherServiceChecks(
   ]);
 }
 
-export async function getOtherServiceHistoryRaw(
+export async function getOtherServiceHistory(
   db: D1Database,
   period: "24h" | "7d" | "30d"
-): Promise<RawOtherServiceRow[]> {
-  const interval = period === "30d" ? "-30 days" : period === "7d" ? "-7 days" : "-24 hours";
+): Promise<OtherServiceHistoryRow[]> {
+  if (period === "24h") {
+    // 3-minute points: the raw rows already are the chart's resolution.
+    const result = await db
+      .prepare(
+        `SELECT timestamp, service_id, COALESCE(response_time_ms, 0) AS sum_response_ms,
+                CASE WHEN response_time_ms IS NULL THEN 0 ELSE 1 END AS n_response
+         FROM other_service_checks
+         WHERE timestamp >= ${CUTOFF}
+         ORDER BY timestamp ASC`
+      )
+      .bind("-24 hours")
+      .all<OtherServiceHistoryRow>();
+    return result.results;
+  }
+
+  // 7d wants 15-minute points, 30d hourly ones -- both stored directly, so this reads
+  // 2,688 and 2,880 rows where it used to pull 12,976 and 45,792 raw ones into the
+  // isolate to bucket them in JS.
+  const granularity = period === "7d" ? "15m" : "1h";
   const result = await db
     .prepare(
-      `SELECT timestamp, service_id, response_time_ms
-       FROM other_service_checks
-       WHERE timestamp >= ${CUTOFF}
-       ORDER BY timestamp ASC`
+      `SELECT bucket_start AS timestamp, service_id, sum_response_ms, n_response
+       FROM other_service_rollup
+       WHERE granularity = '${granularity}'
+         AND bucket_start >= ${CUTOFF}
+       ORDER BY bucket_start ASC`
     )
-    .bind(interval)
-    .all<RawOtherServiceRow>();
+    .bind(period === "7d" ? "-7 days" : "-30 days")
+    .all<OtherServiceHistoryRow>();
   return result.results;
 }
 
