@@ -11,21 +11,31 @@
 
 import { spawn } from "node:child_process";
 
-// Rows scanned per cache miss, from the D1 audit. These are derived from the cron
-// cadence (480 checks/day) and the retention in schema.sql, not measured -- they turn
-// the hit counts into an order-of-magnitude "rows avoided", nothing more precise.
+// Rows read per cache miss. Measured against this deployment's own database on
+// 2026-09-02 by running each route's SQL through "wrangler d1 execute --json" and
+// summing meta.rows_read across the statements the route issues.
+//
+// These are specific to sigaa-caiu-unb-db and are not interchangeable with the UFG
+// deployment's: that one monitors four secondary services to this one's two, so its
+// other_service_checks table grows at twice the rate, and the two databases started
+// collecting on different dates.
+//
+// The figures drift as the tables grow (~480 checks/day, ~960 service checks/day).
+// Windowed routes track their window rather than the table, so they settle once the
+// window is older than the data; the 90d figure still climbs until retention catches
+// up. Re-measure before trusting them to two significant figures.
 const ROWS_PER_MISS = {
-  "v1/api/status": 15, // after the partial layer indexes
-  "v1/api/other-services": 4, // after the batched per-service lookup
-  "v1/api/stats": 61_440,
+  "v1/api/status": 10, // 5 lastN + 1 open incident + 1 per layer, via the partial indexes
+  "v1/api/other-services": 2, // one indexed seek per service, batched
+  "v1/api/stats": 54_223,
   "v1/api/incidents": 10,
-  "v1/api/history/24h": 480,
-  "v1/api/history/7d": 3_360,
-  "v1/api/history/30d": 14_400,
-  "v1/api/history/90d": 43_200,
-  "v1/api/other-services/history/24h": 1_920,
-  "v1/api/other-services/history/7d": 13_440,
-  "v1/api/other-services/history/30d": 57_600,
+  "v1/api/history/24h": 353,
+  "v1/api/history/7d": 7_174,
+  "v1/api/history/30d": 29_241,
+  "v1/api/history/90d": 74_018, // bucketed: reads the index and the rows behind it
+  "v1/api/other-services/history/24h": 706,
+  "v1/api/other-services/history/7d": 6_526,
+  "v1/api/other-services/history/30d": 28_528,
   "v1/": 0,
 };
 
