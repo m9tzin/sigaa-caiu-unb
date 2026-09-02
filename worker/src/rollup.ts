@@ -13,8 +13,14 @@ export type Granularity = "15m" | "1h" | "1d";
 export const CHECK_GRANULARITIES = ["15m", "1h", "1d"] as const satisfies readonly Granularity[];
 export const SERVICE_GRANULARITIES = ["15m", "1h"] as const satisfies readonly Granularity[];
 
-/** The nullable per-layer columns in "checks", in bind order. */
-const LAYERS = ["reachability", "portal", "login_form", "login_e2e"] as const;
+/**
+ * The nullable per-layer columns in "checks", in bind order. Exported so db.ts's
+ * recomputeRollup derives its column list and aggregate expressions from this array
+ * instead of hand-copying it -- a hand-copy that drifts out of position (the SELECT
+ * list is written ~15 lines below the column list) produces no type error and no
+ * runtime error, just a column landing under the wrong name.
+ */
+export const LAYERS = ["reachability", "portal", "login_form", "login_e2e"] as const;
 
 /**
  * Floors a timestamp expression onto its bucket, rendered in the ISO format the

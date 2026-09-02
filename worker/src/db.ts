@@ -9,9 +9,11 @@ import type {
   OtherServiceRow,
 } from "./types";
 import { OTHER_SERVICES } from "./other-services";
+import type { Granularity } from "./rollup";
 import {
   CHECK_GRANULARITIES,
   SERVICE_GRANULARITIES,
+  LAYERS,
   bucketExpr,
   checkRollupUpsertSql,
   serviceRollupUpsertSql,
@@ -52,6 +54,13 @@ export async function saveCheck(
   // check: reading 'now' again in a second statement can cross a bucket boundary.
   const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 
+  // Order must match LAYERS in rollup.ts (reachability, portal, login_form, login_e2e)
+  // -- checkRollupUpsertSql binds these positionally as ?4..?7 in that order. Not
+  // derived from LAYERS itself: the source values live on differently-named,
+  // camelCase properties of CheckResult, so there is no plain string to map through.
+  // reachability is bound raw, unlike the other three: it always runs (never
+  // "skipped"), so its responseTimeMs is never the falsy 0 that `|| null` below exists
+  // to catch on a layer that didn't execute this tick.
   const layerMs = [
     result.reachability.responseTimeMs,
     result.portal.responseTimeMs || null,
@@ -160,12 +169,24 @@ export async function rollupIsEmpty(db: D1Database): Promise<boolean> {
 }
 
 /**
+ * Per-granularity windows for a recompute. A plain string or null applies uniformly to
+ * every granularity and to the service table (what the daily repair passes: "-2 days"
+ * for everything). The bootstrap needs narrower, per-granularity windows instead --
+ * see the RollupWindows overload below.
+ */
+export type RollupWindows = {
+  check: Record<Granularity, string | null>;
+  service: string | null;
+};
+
+/**
  * Rebuilds rollup buckets from the raw tables.
  *
  * Two callers, one body: the daily pass repairs the trailing edge ("-2 days"), and the
- * first tick after a deploy passes null to backfill the whole history. Making the
- * backfill the same code as the repair means the backfill is exercised in production
- * every day instead of being a one-shot script nobody runs twice.
+ * first tick after a deploy backfills the whole history, bounded per granularity (see
+ * RollupWindows) rather than scanning every row ever written. Making the backfill the
+ * same code as the repair means the backfill is exercised in production every day
+ * instead of being a one-shot script nobody runs twice.
  *
  * DO UPDATE *replaces* here, where the write path adds. That is what makes this safe to
  * run against a live worker: re-running it, or overlapping it with incremental upserts,
@@ -173,7 +194,7 @@ export async function rollupIsEmpty(db: D1Database): Promise<boolean> {
  */
 export async function recomputeRollup(
   db: D1Database,
-  since: string | null
+  since: string | null | RollupWindows
 ): Promise<void> {
   // A numbered parameter, not the bare "?" that CUTOFF's other callers bind at most
   // once each: bucketExpr("15m", x) references x twice (the hour part and the minute
@@ -191,20 +212,34 @@ export async function recomputeRollup(
   // idx_checks_timestamp still answers it; flooring the column itself on the left would
   // turn this into a full table scan.
   const cutoffExpr = `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)`;
-  const bind = (stmt: D1PreparedStatement) => (since === null ? stmt : stmt.bind(since));
 
+  // Normalizes the string|null|RollupWindows union into one lookup per table so the
+  // statement builders below don't need to branch on which form the caller passed.
+  const windows: RollupWindows =
+    since === null
+      ? { check: { "15m": null, "1h": null, "1d": null }, service: null }
+      : typeof since === "string"
+        ? { check: { "15m": since, "1h": since, "1d": since }, service: since }
+        : since;
+
+  const bindTo = (stmt: D1PreparedStatement, window: string | null) =>
+    window === null ? stmt : stmt.bind(window);
+
+  // Derived from LAYERS (rollup.ts) instead of hand-copied: checkRollupUpsertSql builds
+  // its column list the same way, so the two agree by construction rather than by
+  // someone remembering to keep three lists in sync.
   const checkCols = [
     "n", "n_offline", "n_degraded", "sum_response_ms", "n_response",
-    "sum_reachability_ms", "n_reachability", "sum_portal_ms", "n_portal",
-    "sum_login_form_ms", "n_login_form", "sum_login_e2e_ms", "n_login_e2e",
+    ...LAYERS.flatMap(l => [`sum_${l}_ms`, `n_${l}`]),
   ];
-  const layerAggs = ["reachability", "portal", "login_form", "login_e2e"]
+  const layerAggs = LAYERS
     .map(l => `COALESCE(SUM(${l}_ms), 0), COUNT(${l}_ms)`)
     .join(", ");
 
   const checkStmts = CHECK_GRANULARITIES.map(g => {
-    const window = since === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
-    return bind(
+    const since_g = windows.check[g];
+    const window = since_g === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
+    return bindTo(
       db.prepare(
         `INSERT INTO check_rollup (granularity, bucket_start, ${checkCols.join(", ")})
          SELECT '${g}',
@@ -219,13 +254,15 @@ export async function recomputeRollup(
          GROUP BY 2
          ON CONFLICT(granularity, bucket_start) DO UPDATE SET
            ${checkCols.map(c => `${c} = excluded.${c}`).join(", ")}`
-      )
+      ),
+      since_g
     );
   });
 
   const serviceStmts = SERVICE_GRANULARITIES.map(g => {
-    const window = since === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
-    return bind(
+    const since_s = windows.service;
+    const window = since_s === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
+    return bindTo(
       db.prepare(
         `INSERT INTO other_service_rollup (granularity, bucket_start, service_id, n, sum_response_ms, n_response)
          SELECT '${g}',
@@ -241,7 +278,8 @@ export async function recomputeRollup(
            n = excluded.n,
            sum_response_ms = excluded.sum_response_ms,
            n_response      = excluded.n_response`
-      )
+      ),
+      since_s
     );
   });
 
@@ -416,7 +454,7 @@ export async function getHistory(
        WHERE granularity = '${granularity}'
          AND bucket_start >= ${CUTOFF}
        GROUP BY ${bucketKey}
-       ORDER BY timestamp ASC`
+       ORDER BY ${bucketKey} ASC`
     )
     .bind(periodToInterval(period))
     .all<CheckRow>();
@@ -459,6 +497,14 @@ export async function getStats(
     ),
     // Incidents stay on the raw table: idx_incidents_started already answers this and
     // the measured cost was ~0. One statement instead of four, same trick.
+    //
+    // Its cutoff is wall-clock ("now minus N days"), not day-floored like dayCutoff()
+    // above -- so for a period like "7d", uptimePercent and avgResponseMs describe the
+    // last 7 whole days plus today, while incidentCount describes a rolling last-7×24h
+    // window ending at this instant. The two halves of one period cover slightly
+    // different spans. Spec-permitted (incidents are cheap enough to answer exactly,
+    // so there was no reason to snap them to the same day-floored window the rollup
+    // needs), just worth knowing before reading too much into a boundary case.
     db.prepare(
       `SELECT
          SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-24 hours') THEN 1 ELSE 0 END) AS c_24h,
