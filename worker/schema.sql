@@ -62,3 +62,8 @@ CREATE TABLE IF NOT EXISTS other_service_checks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_other_service_checks ON other_service_checks(service_id, timestamp DESC);
+
+-- getOtherServiceHistoryRaw filters on timestamp alone, with no service_id, so the
+-- index above -- which leads with service_id -- cannot answer it and the query
+-- degrades into a full table scan. This one covers the time window.
+CREATE INDEX IF NOT EXISTS idx_other_service_checks_ts ON other_service_checks(timestamp);
