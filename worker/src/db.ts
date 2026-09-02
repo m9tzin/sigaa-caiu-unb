@@ -10,6 +10,25 @@ import type {
 } from "./types";
 import { OTHER_SERVICES } from "./other-services";
 
+/**
+ * SQL expression for a time-window cutoff, rendered in the format timestamps are
+ * actually stored in.
+ *
+ * checks.timestamp, other_service_checks.timestamp and incidents.started_at all hold
+ * "2026-09-01T12:00:00Z" -- ISO 8601 with a literal T and Z. datetime() renders
+ * "2026-09-01 02:07:59" instead, and SQLite compares TEXT bytewise: "T" (0x54) sorts
+ * above " " (0x20), so every row from the cutoff's own calendar day compared greater
+ * than the cutoff regardless of the hour it carried. A "-24 hours" window silently
+ * reached back as far as 48, and cleanupOldChecks under-deleted by up to a day.
+ *
+ * Measured on the remote database at 03:00 UTC: the 24h window returned 414 rows where
+ * 352 were in range, and the 30-day cleanup left 122 rows behind. The error is one
+ * partial day, so it grows through the UTC day and peaks just before midnight.
+ *
+ * The interval stays a bound parameter, so callers keep passing "-7 days" as before.
+ */
+const CUTOFF = `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)`;
+
 // --- Write operations ---
 
 export async function saveCheck(
@@ -88,8 +107,8 @@ export async function manageIncidents(
 
 export async function cleanupOldChecks(db: D1Database): Promise<void> {
   await db.batch([
-    db.prepare(`DELETE FROM checks WHERE timestamp < datetime('now', '-730 days')`),
-    db.prepare(`DELETE FROM other_service_checks WHERE timestamp < datetime('now', '-30 days')`),
+    db.prepare(`DELETE FROM checks WHERE timestamp < ${CUTOFF}`).bind("-730 days"),
+    db.prepare(`DELETE FROM other_service_checks WHERE timestamp < ${CUTOFF}`).bind("-30 days"),
   ]);
 }
 
@@ -114,7 +133,7 @@ export async function getOtherServiceHistoryRaw(
     .prepare(
       `SELECT timestamp, service_id, response_time_ms
        FROM other_service_checks
-       WHERE timestamp >= datetime('now', ?)
+       WHERE timestamp >= ${CUTOFF}
        ORDER BY timestamp ASC`
     )
     .bind(interval)
@@ -176,7 +195,7 @@ export async function getHistory(
     const result = await db
       .prepare(
         `SELECT * FROM checks
-         WHERE timestamp >= datetime('now', ?)
+         WHERE timestamp >= ${CUTOFF}
          ORDER BY timestamp ASC`
       )
       .bind(interval)
@@ -214,7 +233,7 @@ export async function getHistory(
          ROUND(AVG(login_e2e_ms)) as login_e2e_ms,
          NULL as login_e2e_error
        FROM checks
-       WHERE timestamp >= datetime('now', ?)
+       WHERE timestamp >= ${CUTOFF}
        GROUP BY strftime('%Y-%m-%dT%H:', timestamp) ||
          printf('%02d', (CAST(strftime('%M', timestamp) AS INTEGER) / ${bucketMinutes}) * ${bucketMinutes})
        ORDER BY timestamp ASC`
@@ -239,7 +258,7 @@ export async function getStats(
            ROUND(100.0 * SUM(CASE WHEN status != 'offline' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2) AS uptime_pct,
            ROUND(AVG(response_time_ms)) AS avg_ms
          FROM checks
-         WHERE timestamp >= datetime('now', ?)`
+         WHERE timestamp >= ${CUTOFF}`
       )
       .bind(interval)
       .first<{ uptime_pct: number; avg_ms: number }>();
@@ -247,7 +266,7 @@ export async function getStats(
     const incidentResult = await db
       .prepare(
         `SELECT COUNT(*) as count FROM incidents
-         WHERE started_at >= datetime('now', ?)`
+         WHERE started_at >= ${CUTOFF}`
       )
       .bind(interval)
       .first<{ count: number }>();
