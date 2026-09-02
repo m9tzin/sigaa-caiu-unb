@@ -40,6 +40,11 @@ export default {
     ]);
     const lastChecks = await getLastNChecks(env.DB, 2);
 
+    // Captured before the write batch below: saveCheck's own upsert would otherwise
+    // populate check_rollup for this tick and hide the empty table from us, so the
+    // deploy backfill would never fire.
+    const rollupEmpty = await rollupIsEmpty(env.DB);
+
     await Promise.all([
       saveCheck(env.DB, result),
       saveOtherServiceChecks(env.DB, otherResults),
@@ -50,7 +55,7 @@ export default {
     // The rollup is empty exactly once: on the first tick after the tables ship. That
     // tick backfills the whole history; every later day only repairs the trailing edge.
     // Same function, so the backfill path is not dead code between deploys.
-    if (await rollupIsEmpty(env.DB)) {
+    if (rollupEmpty) {
       ctx.waitUntil(recomputeRollup(env.DB, null));
     } else if (now.getUTCHours() === 3 && minute < 5) {
       ctx.waitUntil(recomputeRollup(env.DB, "-2 days"));
