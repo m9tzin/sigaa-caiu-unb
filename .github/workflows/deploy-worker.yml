@@ -20,6 +20,17 @@ jobs:
         run: npm ci
         working-directory: worker
 
+      # Blocks the deploy when the database does not match schema.sql. The migration
+      # files are applied by hand, so without this a forgotten "wrangler d1 execute
+      # --remote" ships code against a database that never got its indexes -- which is
+      # exactly what happened with the partial layer indexes.
+      - name: Verify database schema
+        run: npm run db:verify
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Deploy to Cloudflare
         run: npx wrangler deploy
         working-directory: worker

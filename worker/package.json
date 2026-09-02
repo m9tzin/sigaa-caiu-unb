@@ -7,6 +7,8 @@
     "deploy": "wrangler deploy",
     "db:local": "wrangler d1 execute sigaa-caiu-unb-db --local --file=schema.sql",
     "db:remote": "wrangler d1 execute sigaa-caiu-unb-db --remote --file=schema.sql",
+    "db:verify": "node scripts/db-verify.mjs",
+    "db:verify:local": "node scripts/db-verify.mjs --local",
     "cache:stats": "node scripts/cache-stats.mjs"
   },
   "devDependencies": {

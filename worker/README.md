@@ -54,7 +54,31 @@ npx wrangler d1 execute sigaa-caiu-unb-db --remote --file=schema.sql
 
 # Indices parciais que removem full table scans (ver secao Cache)
 npx wrangler d1 execute sigaa-caiu-unb-db --remote --file=schema_migration_cache_indexes.sql
+
+# Indice de janela temporal em other_service_checks
+npx wrangler d1 execute sigaa-caiu-unb-db --remote --file=schema_migration_timestamp_index.sql
 ```
+
+### Conferir se o banco bate com o schema
+
+As migracoes acima sao aplicadas na mao, e nada avisa quando alguem esquece. Ja
+aconteceu: os indices parciais ficaram commitados no repo por semanas enquanto o banco
+rodava sem eles, e o unico sintoma era uma consulta lendo a tabela inteira a cada
+request. O verificador compara `schema.sql` com o `sqlite_master` do banco e sai com
+codigo 1 se divergir.
+
+```bash
+npm run db:verify         # banco remoto
+npm run db:verify:local   # banco local do `wrangler dev`
+```
+
+Compara definicao, nao so nome: um indice que existe com o nome certo mas nas colunas
+erradas tambem e apontado. O deploy roda isso antes do `wrangler deploy`, entao um
+banco desatualizado quebra o build em vez de passar despercebido.
+
+Quando falhar por objeto faltando, `npm run db:remote` resolve -- o `schema.sql` e todo
+`IF NOT EXISTS` e pode ser reexecutado. Coluna nova e outra historia: `CREATE TABLE` nao
+altera tabela existente, entao essas continuam vindo dos `schema_migration_*.sql`.
 
 ## Deploy
 
