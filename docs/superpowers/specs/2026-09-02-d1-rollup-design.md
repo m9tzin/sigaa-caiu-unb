@@ -312,15 +312,24 @@ devolveria NULL hoje. Sem ele, uma camada ausente em todo o grupo vira uma linha
 
 Para 7d e 30d o `GROUP BY` some — a granularidade já é a certa.
 
-**Mudanças visíveis na resposta da API**, ambas em campos que nenhum componente
+**Mudanças visíveis na resposta da API**, todas em campos que nenhum componente
 renderiza:
 
 - `http_code` passa a ser `NULL` no caminho bucketizado. Hoje é
   `ROUND(AVG(http_code))` — a média entre um 200 e um 500 é 350, um número sem
   significado. Está em `web/src/lib/types.ts` mas nenhum componente lê.
+- `reachability_http` passa a ser `NULL` pelo mesmo motivo: `check_rollup` não guarda
+  soma de `reachability_http`, então não há como reconstruir a antiga
+  `ROUND(AVG(reachability_http))`. Mesmo caso do `http_code` acima, uma camada abaixo.
 - `id` passa a ser `CAST(strftime('%s', bucket_start) AS INTEGER)`. Hoje é o `id`
   arbitrário de uma linha do grupo. Os gráficos usam o índice do array como `key`
   (`ResponseTimeChart.tsx:52`, `LayerResponseChart.tsx:67`), não o `id`.
+- `timestamp` passa a ser o próprio limite do bucket (`bucket_start`, ou a expressão de
+  agrupamento de 3h no caso do 90d), não mais `MIN(timestamp)` das linhas cruas que
+  caíram nele. Os dois só coincidem se a primeira checagem do bucket acontecer
+  exatamente no seu início; na prática o valor agora é sempre um pouco mais cedo (ou
+  igual) ao que o caminho antigo devolvia. Nenhum componente depende do valor exato,
+  só da ordem — ver `ORDER BY` na consulta acima.
 
 ### Resultado
 
