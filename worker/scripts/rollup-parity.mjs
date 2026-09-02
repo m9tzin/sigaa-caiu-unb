@@ -34,8 +34,26 @@ import { fileURLToPath } from "node:url";
 const workerDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 const local = process.argv.includes("--local");
 
-const dbName = JSON.parse(readFileSync(join(workerDir, "wrangler.jsonc"), "utf8").replace(/^\s*\/\/.*$/gm, ""))
-  .d1_databases[0].database_name;
+/**
+ * wrangler.jsonc is JSON with comments in principle -- a regex extracts the one field
+ * this script needs without caring about JSONC syntax (inline comments, block
+ * comments, trailing commas) that would make a whole-file JSON.parse throw. Same
+ * idiom as databaseName() in db-verify.mjs, except this exits 2 instead of throwing:
+ * an uncaught exception here would exit the process with code 1, which this script's
+ * own contract reserves for "diverged" -- a config file could not be parsed is
+ * "could not query", not a divergence.
+ */
+function databaseName() {
+  const raw = readFileSync(join(workerDir, "wrangler.jsonc"), "utf8");
+  const match = /"database_name"\s*:\s*"([^"]+)"/.exec(raw);
+  if (!match) {
+    console.error("database_name nao encontrado em wrangler.jsonc");
+    process.exit(2);
+  }
+  return match[1];
+}
+
+const dbName = databaseName();
 
 function query(sql) {
   try {
