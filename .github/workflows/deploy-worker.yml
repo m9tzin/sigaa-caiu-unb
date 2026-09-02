@@ -5,6 +5,12 @@ on:
     branches: [main]
     paths:
       - "worker/**"
+  workflow_dispatch:
+    inputs:
+      skip_db_verify:
+        description: "Publicar sem confirmar o schema do D1 (use so para mudanca de codigo, ou quando o schema ja foi aplicado a mao)"
+        type: boolean
+        default: false
 
 jobs:
   deploy:
@@ -25,11 +31,24 @@ jobs:
       # --remote" ships code against a database that never got its indexes -- which is
       # exactly what happened with the partial layer indexes.
       #
-      # Drift (exit 1) fails the build. Being unable to check at all (exit 2) only
-      # warns: the token that deploys a Worker does not automatically carry D1:Read, and
-      # a permissions gap in an auxiliary check should not take deployment down with it.
-      # The warning annotation keeps that state visible instead of silently green.
+      # Both drift (exit 1) and being unable to check at all (exit 2) now fail the build.
+      # Exit 2 used to be a warning, on the reasoning that a permissions gap in an
+      # auxiliary check should not take deployment down with it. The rollup changed what
+      # is at stake: rollupIsEmpty() is the first await in scheduled(), so a Worker that
+      # ships before its tables exist throws on every cron tick -- no checks recorded, no
+      # incidents managed, no notifications sent. The monitor goes down entirely, not
+      # just its indexes. An unverifiable database is no longer a risk worth deploying
+      # through.
+      #
+      # The usual cause of exit 2 is the deploy token lacking D1:Read; adding that scope
+      # is the fix. To ship anyway -- a code-only change, or a deliberate
+      # schema-then-code rollout -- run the workflow manually with skip_db_verify.
+      - name: Typecheck
+        working-directory: worker
+        run: npm run typecheck
+
       - name: Verify database schema
+        if: ${{ inputs.skip_db_verify != true }}
         working-directory: worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -43,7 +62,8 @@ jobs:
             echo "::error::O banco divergiu de schema.sql; veja a saida acima."
             exit 1
           elif [ "$code" -ne 0 ]; then
-            echo "::warning::db:verify nao conseguiu consultar o D1 (exit $code). O deploy segue, mas sem a checagem de schema."
+            echo "::error::db:verify nao conseguiu consultar o D1 (exit $code), entao nao da para saber se as tabelas existem. Publicar assim derruba o cron inteiro se o schema estiver atrasado. Provavel causa: o token do deploy nao tem D1:Read. Para publicar mesmo assim, rode o workflow manualmente com skip_db_verify=true."
+            exit 1
           fi
 
       - name: Deploy to Cloudflare
