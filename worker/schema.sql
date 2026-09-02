@@ -67,3 +67,49 @@ CREATE INDEX IF NOT EXISTS idx_other_service_checks ON other_service_checks(serv
 -- index above -- which leads with service_id -- cannot answer it and the query
 -- degrades into a full table scan. This one covers the time window.
 CREATE INDEX IF NOT EXISTS idx_other_service_checks_ts ON other_service_checks(timestamp);
+
+-- Pre-aggregated buckets. The aggregate routes used to scan their whole raw window on
+-- every cache miss -- /api/stats alone read 60,750 rows per miss, half of the account's
+-- entire 5M/day D1 budget. These tables hold the same numbers at three granularities so
+-- a miss reads hundreds of rows instead of tens of thousands.
+--
+-- Sums and counts, never averages: an average cannot be re-aggregated, so a 3-hour
+-- bucket built from three hourly ones must compute SUM(sum_x) / SUM(n_x). Each layer
+-- carries its own count because the *_ms columns in "checks" are NULL whenever the
+-- layer did not run that tick, and AVG() skips NULLs -- dividing by the global n would
+-- pull those averages toward zero.
+--
+-- bucket_start is stored in the same ISO format as checks.timestamp at every
+-- granularity, '1d' included (it aligns on T00:00:00Z). See the CUTOFF comment in
+-- src/db.ts for why a datetime()-shaped value would compare wrong.
+CREATE TABLE IF NOT EXISTS check_rollup (
+  granularity         TEXT    NOT NULL CHECK (granularity IN ('15m','1h','1d')),
+  bucket_start        TEXT    NOT NULL,
+  n                   INTEGER NOT NULL DEFAULT 0,
+  n_offline           INTEGER NOT NULL DEFAULT 0,
+  n_degraded          INTEGER NOT NULL DEFAULT 0,
+  sum_response_ms     INTEGER NOT NULL DEFAULT 0,
+  n_response          INTEGER NOT NULL DEFAULT 0,
+  sum_reachability_ms INTEGER NOT NULL DEFAULT 0,
+  n_reachability      INTEGER NOT NULL DEFAULT 0,
+  sum_portal_ms       INTEGER NOT NULL DEFAULT 0,
+  n_portal            INTEGER NOT NULL DEFAULT 0,
+  sum_login_form_ms   INTEGER NOT NULL DEFAULT 0,
+  n_login_form        INTEGER NOT NULL DEFAULT 0,
+  sum_login_e2e_ms    INTEGER NOT NULL DEFAULT 0,
+  n_login_e2e         INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (granularity, bucket_start)
+);
+
+-- Same idea for the auxiliary services, minus the status counters: the route only ever
+-- renders response times (see pivotOtherServiceRows in src/api.ts). No '1d' row -- the
+-- other-services chart stops at 30 days and /api/stats does not cover these services.
+CREATE TABLE IF NOT EXISTS other_service_rollup (
+  granularity     TEXT    NOT NULL CHECK (granularity IN ('15m','1h')),
+  bucket_start    TEXT    NOT NULL,
+  service_id      TEXT    NOT NULL,
+  n               INTEGER NOT NULL DEFAULT 0,
+  sum_response_ms INTEGER NOT NULL DEFAULT 0,
+  n_response      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (granularity, bucket_start, service_id)
+);
