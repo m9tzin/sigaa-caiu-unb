@@ -89,11 +89,81 @@ npx wrangler deploy
 ## Schema D1
 
 ```sql
-checks (id, timestamp, status, http_code, response_time_ms, error)
+checks (id, timestamp, status, http_code, response_time_ms, error, <4 camadas>)
 incidents (id, started_at, ended_at, duration_s)
+other_service_checks (id, timestamp, service_id, status, http_code, response_time_ms, error)
+
+check_rollup (granularity, bucket_start, n, n_offline, n_degraded,
+              sum_response_ms, n_response, <sum_x_ms + n_x por camada>)
+other_service_rollup (granularity, bucket_start, service_id, n, sum_response_ms, n_response)
 ```
 
-Dados sao mantidos por 2 anos. Cleanup automatico roda diariamente via cron.
+Dados crus sao mantidos por 2 anos (`checks`) e 30 dias (`other_service_checks`).
+Cleanup automatico roda diariamente via cron.
+
+## Rollup
+
+As rotas agregadas liam a janela crua inteira a cada miss de cache. `/api/stats`
+sozinha custava 60.750 linhas por leitura -- metade do teto diario de 5M do D1, que
+e **por conta**, nao por banco (este projeto divide a conta com `sigaa-caiu-unb`).
+As duas tabelas de rollup guardam os agregados prontos: hoje a mesma rota le ~118
+linhas, e o consumo diario da UFG caiu de 17,3M para 1,4M.
+
+Tres regras sustentam o desenho. Quebrar qualquer uma corrompe numeros em silencio:
+
+**Soma e contagem, nunca media.** Medias nao recompoem. Um ponto de 3 horas vem de
+`SUM(sum_x) / SUM(n_x)` sobre tres buckets horarios, jamais da media das medias.
+
+**Uma contagem por camada.** As colunas `*_ms` de `checks` sao NULL quando a camada
+nao rodou, e `AVG()` ignora NULL. Dividir pelo `n` global diluiria a media justamente
+nas camadas que rodam menos. Por isso cada camada carrega seu proprio `n_x`, e a
+leitura devolve `NULL` (nao `0`) quando `SUM(n_x) = 0` -- um `0` desenha uma linha
+rente ao chao no grafico onde deveria haver um buraco.
+
+**A escrita SOMA, o recompute SUBSTITUI.** `saveCheck` faz `n = n + 1` dentro do
+mesmo `db.batch()` que grava a linha crua, entao o check e sua contribuicao caem
+juntos ou nao caem. `recomputeRollup` faz `n = excluded.n`. Trocar as duas contaria
+em dobro todo bucket que o recompute tocasse -- e ele roda com o worker no ar.
+
+`recomputeRollup(db, windows)` serve a dois chamadores: o reparo diario das 03:00
+UTC, que refaz os ultimos 2 dias a partir do cru, e o bootstrap de deploy, que
+reconstroi o historico quando o rollup esta vazio. Mesmo codigo, entao o caminho do
+backfill e exercitado em producao todos os dias.
+
+### Cortes de janela precisam estar alinhados ao bucket
+
+Um corte em instante de relogio (`now - 7 days`) cai no meio de um bucket. Se a
+consulta filtra o lado fino e o JOIN traz o lado grosso inteiro, a borda compara tres
+quartos contra quatro e diverge para sempre. Se o recompute substitui um bucket
+reagregado so com as linhas depois do corte, ele sobrescreve um bucket correto por um
+subcontado -- de forma permanente, porque no dia seguinte a janela ja passou dele.
+
+Este repo publicou essa falha tres vezes (`083ec9e`, a janela de reparo, e depois o
+proprio `rollup-parity`). **Todo corte comparado contra `bucket_start` tem de ser
+alinhado a granularidade mais grossa dos dois lados.**
+
+### Rollout
+
+A ordem nao e negociavel: **banco antes de codigo**. `rollupIsEmpty` e o primeiro
+`await` de `scheduled()`, entao publicar antes das tabelas existirem faz o handler
+inteiro lancar excecao -- sem checks, sem incidentes, sem notificacoes. Nao e o
+rollup que falta, e o monitor que para.
+
+Rode o backfill a mao entre aplicar o schema e publicar. O bootstrap interno dispara
+uma vez so e, se falhar, `saveCheck` ja tornou a tabela nao-vazia -- ele nao tenta de
+novo, e o historico nunca e reconstruido.
+
+```bash
+npm run db:remote      # cria as tabelas
+npm run db:verify      # tem de dizer "tudo em dia"
+# backfill a mao (ver docs/superpowers/plans/2026-09-02-d1-rollup.md, Task 9)
+npm run deploy
+npm run rollup:parity  # roda a query velha e a nova lado a lado e exige que concordem
+```
+
+`rollup-parity` sai 0 quando concordam, 1 quando divergem e 2 quando nao conseguiu
+consultar -- o mesmo contrato de `db-verify`. Ele tambem imprime `rows_read` dos dois
+lados, que e de onde saem os numeros de `ROWS_PER_MISS` em `scripts/cache-stats.mjs`.
 
 ## Cache
 

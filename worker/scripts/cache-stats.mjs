@@ -11,19 +11,21 @@
 
 import { spawn } from "node:child_process";
 
-// Rows read per cache miss. Measured against this deployment's own database on
-// 2026-09-02 by running each route's SQL through "wrangler d1 execute --json" and
-// summing meta.rows_read across the statements the route issues.
+// Rows read per cache miss.
 //
-// These are specific to sigaa-caiu-unb-db and are not interchangeable with the UFG
-// deployment's: that one monitors four secondary services to this one's two, so its
-// other_service_checks table grows at twice the rate, and the two databases started
-// collecting on different dates.
+// THESE ARE PRE-ROLLUP NUMBERS and are wrong the moment this branch deploys. They were
+// measured on 2026-09-02, before the rollup existed, and describe the aggregate routes
+// scanning their whole raw window. After the UnB rollout (schema, manual backfill,
+// deploy) re-measure with "npm run rollup:parity", which prints rows_read for both
+// sides of every case, and replace the aggregate figures below.
 //
-// The figures drift as the tables grow (~480 checks/day, ~960 service checks/day).
-// Windowed routes track their window rather than the table, so they settle once the
-// window is older than the data; the 90d figure still climbs until retention catches
-// up. Re-measure before trusting them to two significant figures.
+// The numbers are per database and must not be copied from sigaa-caiu-ufg: that
+// database is larger and monitors four auxiliary services against this one's two. For
+// scale, UFG measured /api/stats at 118 rows per miss after its rollup shipped, down
+// from 60,750 -- expect the same shape here, not the same values.
+//
+// The 24h routes read raw 3-minute points and are unchanged by the rollup, so their
+// figures below stay valid.
 const ROWS_PER_MISS = {
   "v1/api/status": 10, // 5 lastN + 1 open incident + 1 per layer, via the partial indexes
   "v1/api/other-services": 2, // one indexed seek per service, batched
