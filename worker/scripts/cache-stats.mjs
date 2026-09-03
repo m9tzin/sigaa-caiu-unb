@@ -11,33 +11,39 @@
 
 import { spawn } from "node:child_process";
 
-// Rows read per cache miss.
+// Rows read per cache miss. Measured against the remote database on 2026-09-03, right
+// after the rollup shipped, by running each route's own SQL through
+// "wrangler d1 execute --remote --json" and reading meta.rows_read.
 //
-// THESE ARE PRE-ROLLUP NUMBERS and are wrong the moment this branch deploys. They were
-// measured on 2026-09-02, before the rollup existed, and describe the aggregate routes
-// scanning their whole raw window. After the UnB rollout (schema, manual backfill,
-// deploy) re-measure with "npm run rollup:parity", which prints rows_read for both
-// sides of every case, and replace the aggregate figures below.
+// The aggregate routes read pre-aggregated buckets now instead of scanning their raw
+// window: /api/stats fell from 54,223 to ~261, and the 30-day history from 29,241 to
+// 693. The 24h routes are unchanged -- they return 3-minute points, the cron's own
+// cadence, so there is nothing to downsample.
 //
-// The numbers are per database and must not be copied from sigaa-caiu-ufg: that
-// database is larger and monitors four auxiliary services against this one's two. For
-// scale, UFG measured /api/stats at 118 rows per miss after its rollup shipped, down
-// from 60,750 -- expect the same shape here, not the same values.
+// /api/stats is dominated by its incidents statement (180 of the 261), which still
+// reads the raw table on purpose: idx_incidents_started answers it and a rollup for
+// incidents would not pay for itself. That split is worth remembering before chasing
+// the remaining cost here.
 //
-// The 24h routes read raw 3-minute points and are unchanged by the rollup, so their
-// figures below stay valid.
+// 90d reads 3,498 rather than the 720 buckets it groups: rows_read counts index entries
+// alongside table rows. Expect that multiplier on every figure below.
+//
+// These are per database. sigaa-caiu-ufg measured different values on the same code --
+// a larger table and four auxiliary services against this one's two -- so never copy
+// numbers between the repos. Re-measure with "npm run rollup:parity", which prints
+// rows_read for both sides of every case.
 const ROWS_PER_MISS = {
   "v1/api/status": 10, // 5 lastN + 1 open incident + 1 per layer, via the partial indexes
   "v1/api/other-services": 2, // one indexed seek per service, batched
-  "v1/api/stats": 54_223,
+  "v1/api/stats": 261, // 78 daily buckets + 3 hourly + 180 incidents, three statements
   "v1/api/incidents": 10,
-  "v1/api/history/24h": 353,
-  "v1/api/history/7d": 7_174,
-  "v1/api/history/30d": 29_241,
-  "v1/api/history/90d": 74_018, // bucketed: reads the index and the rows behind it
-  "v1/api/other-services/history/24h": 706,
-  "v1/api/other-services/history/7d": 6_526,
-  "v1/api/other-services/history/30d": 28_528,
+  "v1/api/history/24h": 353, // raw 3-minute points, unchanged
+  "v1/api/history/7d": 564, // '15m' buckets, read straight
+  "v1/api/history/30d": 693, // '1h' buckets, read straight
+  "v1/api/history/90d": 3_498, // '1h' buckets grouped 3:1 into 3-hour points
+  "v1/api/other-services/history/24h": 706, // raw, unchanged
+  "v1/api/other-services/history/7d": 1_127,
+  "v1/api/other-services/history/30d": 1_386,
   "v1/": 0,
 };
 
