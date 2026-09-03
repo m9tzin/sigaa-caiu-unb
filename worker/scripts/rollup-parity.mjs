@@ -100,12 +100,17 @@ const CASES = [
     // Composition: an hourly bucket rebuilt from four 15-minute ones must equal the raw
     // average. This is the proof that sum/count was right and storing averages would
     // have been wrong.
+    // The lower cutoff is floored to the hour. Left at a wall-clock instant it lands
+    // mid-hour, dropping the 15m buckets before it while the join still reaches the
+    // whole 1h bucket -- so the boundary hour compares three quarters against four and
+    // fails forever. Same boundary bug the repair window in db.ts had: a window has to
+    // align to the coarser bucket on both sides of the comparison.
     name: "composicao 15m -> 1h",
     old: `SELECT COUNT(*) AS v FROM (
             SELECT strftime('%Y-%m-%dT%H:00:00Z', bucket_start) AS h,
                    SUM(sum_response_ms) AS s, SUM(n_response) AS n
             FROM check_rollup WHERE granularity='15m'
-              AND bucket_start >= ${ISO}'-7 days')
+              AND bucket_start >= strftime('%Y-%m-%dT%H:00:00Z','now','-7 days')
             GROUP BY 1
           ) a JOIN check_rollup b
             ON b.granularity='1h' AND b.bucket_start = a.h
@@ -153,12 +158,15 @@ const CASES = [
     // raw checks -- and a double-count desyncs exactly one of those three from the
     // other two. Restricted to full UTC days (excludes today) so a cron write landing
     // between this query and the next can't make an in-progress day look wrong.
+    // Floored to the day for the same reason the case above is floored to the hour:
+    // an unfloored cutoff truncates the 15m side of the boundary day while the '1d'
+    // bucket and the raw count join in whole, and the day mismatches permanently.
     name: "consistencia entre granularidades (15m/1d/cru)",
     old: `SELECT COUNT(*) AS v FROM (
             SELECT date(bucket_start) AS d, SUM(n) AS s
             FROM check_rollup
             WHERE granularity = '15m'
-              AND bucket_start >= ${ISO}'-7 days')
+              AND bucket_start >= strftime('%Y-%m-%dT00:00:00Z','now','-7 days')
               AND bucket_start < strftime('%Y-%m-%dT00:00:00Z','now')
             GROUP BY d
           ) fifteen
