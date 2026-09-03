@@ -1,4 +1,4 @@
-import type { Env, RawOtherServiceRow } from "./types";
+import type { Env, OtherServiceHistoryRow } from "./types";
 import {
   getLastNChecks,
   getOpenIncident,
@@ -7,7 +7,7 @@ import {
   getRecentIncidents,
   getLastKnownLayers,
   getLatestOtherServiceChecks,
-  getOtherServiceHistoryRaw,
+  getOtherServiceHistory,
 } from "./db";
 import { OTHER_SERVICES } from "./other-services";
 
@@ -123,7 +123,9 @@ async function handleIncidents(env: Env): Promise<Response> {
 }
 
 async function handleOtherServicesHistory(env: Env, period: "24h" | "7d" | "30d"): Promise<Response> {
-  const rows = await getOtherServiceHistoryRaw(env.DB, period);
+  const rows = await getOtherServiceHistory(env.DB, period);
+  // bucketTs is idempotent on an already-aligned timestamp, so the rollup paths pass
+  // through unchanged and the 24h path still gets its 3-minute grouping.
   const bucketMinutes = period === "30d" ? 60 : period === "7d" ? 15 : 3;
   const checks = pivotOtherServiceRows(rows, bucketMinutes);
   return json({ period, checks });
@@ -136,9 +138,9 @@ function bucketTs(ts: string, bucketMinutes: number): string {
 }
 
 function pivotOtherServiceRows(
-  rows: RawOtherServiceRow[],
+  rows: OtherServiceHistoryRow[],
   bucketMinutes: number
-): { timestamp: string; matriculaweb_ms: number | null; bce_ms: number | null }[] {
+): Record<string, string | number | null>[] {
   const buckets = new Map<string, Record<string, { sum: number; count: number }>>();
 
   for (const row of rows) {
@@ -147,16 +149,23 @@ function pivotOtherServiceRows(
     const b = buckets.get(ts)!;
     const key = `${row.service_id}_ms`;
     if (!b[key]) b[key] = { sum: 0, count: 0 };
-    b[key].sum += row.response_time_ms;
-    b[key].count++;
+    b[key].sum += row.sum_response_ms;
+    b[key].count += row.n_response;
   }
+
+  // Derived from OTHER_SERVICES so porting a new service list (as in the sibling
+  // repo's matriculaweb/bce port) is a zero-line change here: no per-service line to
+  // remember the `&& b.X.count > 0` guard on. A service with no timed samples in a
+  // bucket -- b[key] undefined, or count 0 -- must come back null rather than NaN or a
+  // depressed average toward 0 (Ruling 9).
+  const avg = (b: Record<string, { sum: number; count: number }>, key: string): number | null =>
+    b[key] && b[key].count > 0 ? Math.round(b[key].sum / b[key].count) : null;
 
   return Array.from(buckets.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([ts, b]) => ({
       timestamp: ts,
-      matriculaweb_ms: b.matriculaweb_ms ? Math.round(b.matriculaweb_ms.sum / b.matriculaweb_ms.count) : null,
-      bce_ms: b.bce_ms ? Math.round(b.bce_ms.sum / b.bce_ms.count) : null,
+      ...Object.fromEntries(OTHER_SERVICES.map(s => [`${s.id}_ms`, avg(b, `${s.id}_ms`)])),
     }));
 }
 

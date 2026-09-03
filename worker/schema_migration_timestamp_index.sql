@@ -3,8 +3,8 @@
 -- Run with:  npx wrangler d1 execute sigaa-caiu-unb-db --local  --file=schema_migration_timestamp_index.sql
 --            npx wrangler d1 execute sigaa-caiu-unb-db --remote --file=schema_migration_timestamp_index.sql
 
--- getOtherServiceHistoryRaw filters on "WHERE timestamp >= datetime('now', ?)" with
--- no service_id. The only index on the table is idx_other_service_checks(service_id,
+-- getOtherServiceHistory's 24h branch filters on "WHERE timestamp >= datetime('now', ?)"
+-- with no service_id. The only index on the table is idx_other_service_checks(service_id,
 -- timestamp DESC), where timestamp is not the leading column, so the predicate cannot
 -- reach it: SQLite falls back to "SCAN other_service_checks" plus a temp B-tree for
 -- the ORDER BY.

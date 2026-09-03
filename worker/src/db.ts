@@ -5,10 +5,19 @@ import type {
   LastKnownLayers,
   LayerStatus,
   OtherServiceCheckResult,
+  OtherServiceHistoryRow,
   OtherServiceRow,
-  RawOtherServiceRow,
 } from "./types";
 import { OTHER_SERVICES } from "./other-services";
+import type { Granularity } from "./rollup";
+import {
+  CHECK_GRANULARITIES,
+  SERVICE_GRANULARITIES,
+  LAYERS,
+  bucketExpr,
+  checkRollupUpsertSql,
+  serviceRollupUpsertSql,
+} from "./rollup";
 
 /**
  * SQL expression for a time-window cutoff, rendered in the format timestamps are
@@ -40,36 +49,65 @@ export async function saveCheck(
   const skippedToNull = (s: LayerStatus): string | null =>
     s === "skipped" ? null : s;
 
-  await db
-    .prepare(
-      `INSERT INTO checks (
-         status, http_code, response_time_ms, error,
-         reachability_status, reachability_http, reachability_ms, reachability_error,
-         portal_status, portal_ms, portal_error,
-         login_form_status, login_form_ms, login_form_error,
-         login_e2e_status, login_e2e_ms, login_e2e_error
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      result.status,
-      result.httpCode,
-      result.responseTimeMs,
-      result.error,
-      skippedToNull(result.reachability.status),
-      result.reachability.httpCode,
-      result.reachability.responseTimeMs,
-      result.reachability.error,
-      skippedToNull(result.portal.status),
-      result.portal.responseTimeMs || null,
-      result.portal.error,
-      skippedToNull(result.loginForm.status),
-      result.loginForm.responseTimeMs || null,
-      result.loginForm.error,
-      skippedToNull(result.loginE2e.status),
-      result.loginE2e.responseTimeMs || null,
-      result.loginE2e.error
-    )
-    .run();
+  // The timestamp used to come from the column DEFAULT. It is bound explicitly now
+  // because the rollup upserts below have to land in the bucket that holds *this*
+  // check: reading 'now' again in a second statement can cross a bucket boundary.
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  // Order must match LAYERS in rollup.ts (reachability, portal, login_form, login_e2e)
+  // -- checkRollupUpsertSql binds these positionally as ?4..?7 in that order. Not
+  // derived from LAYERS itself: the source values live on differently-named,
+  // camelCase properties of CheckResult, so there is no plain string to map through.
+  // reachability is bound raw, unlike the other three: it always runs (never
+  // "skipped"), so its responseTimeMs is never the falsy 0 that `|| null` below exists
+  // to catch on a layer that didn't execute this tick.
+  const layerMs = [
+    result.reachability.responseTimeMs,
+    result.portal.responseTimeMs || null,
+    result.loginForm.responseTimeMs || null,
+    result.loginE2e.responseTimeMs || null,
+  ];
+
+  // One batch, so the check and its contribution to every rollup bucket either all
+  // land or none do. D1 batches are atomic, which is what makes the incremental
+  // upsert safe without a reconciliation pass on every tick.
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO checks (
+           timestamp, status, http_code, response_time_ms, error,
+           reachability_status, reachability_http, reachability_ms, reachability_error,
+           portal_status, portal_ms, portal_error,
+           login_form_status, login_form_ms, login_form_error,
+           login_e2e_status, login_e2e_ms, login_e2e_error
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        timestamp,
+        result.status,
+        result.httpCode,
+        result.responseTimeMs,
+        result.error,
+        skippedToNull(result.reachability.status),
+        result.reachability.httpCode,
+        result.reachability.responseTimeMs,
+        result.reachability.error,
+        skippedToNull(result.portal.status),
+        result.portal.responseTimeMs || null,
+        result.portal.error,
+        skippedToNull(result.loginForm.status),
+        result.loginForm.responseTimeMs || null,
+        result.loginForm.error,
+        skippedToNull(result.loginE2e.status),
+        result.loginE2e.responseTimeMs || null,
+        result.loginE2e.error
+      ),
+    ...CHECK_GRANULARITIES.map(g =>
+      db
+        .prepare(checkRollupUpsertSql(g))
+        .bind(timestamp, result.status, result.responseTimeMs, ...layerMs)
+    ),
+  ]);
 }
 
 export async function manageIncidents(
@@ -109,7 +147,143 @@ export async function cleanupOldChecks(db: D1Database): Promise<void> {
   await db.batch([
     db.prepare(`DELETE FROM checks WHERE timestamp < ${CUTOFF}`).bind("-730 days"),
     db.prepare(`DELETE FROM other_service_checks WHERE timestamp < ${CUTOFF}`).bind("-30 days"),
+    // Margin over what the routes actually read: history stops at 90 days, /api/stats
+    // at 90 daily buckets, the other-services chart at 30 days.
+    db
+      .prepare(
+        `DELETE FROM check_rollup
+         WHERE granularity IN ('15m','1h') AND bucket_start < ${CUTOFF}`
+      )
+      .bind("-100 days"),
+    db
+      .prepare(`DELETE FROM check_rollup WHERE granularity = '1d' AND bucket_start < ${CUTOFF}`)
+      .bind("-400 days"),
+    db.prepare(`DELETE FROM other_service_rollup WHERE bucket_start < ${CUTOFF}`).bind("-40 days"),
   ]);
+}
+
+/** True when the rollup has never been populated -- the deploy-time bootstrap signal. */
+export async function rollupIsEmpty(db: D1Database): Promise<boolean> {
+  const row = await db.prepare(`SELECT 1 FROM check_rollup LIMIT 1`).first();
+  return row === null;
+}
+
+/**
+ * Per-granularity windows for a recompute. A plain string or null applies uniformly to
+ * every granularity and to the service table (what the daily repair passes: "-2 days"
+ * for everything). The bootstrap needs narrower, per-granularity windows instead --
+ * see the RollupWindows overload below.
+ */
+export type RollupWindows = {
+  check: Record<Granularity, string | null>;
+  service: string | null;
+};
+
+/**
+ * Rebuilds rollup buckets from the raw tables.
+ *
+ * Two callers, one body: the daily pass repairs the trailing edge ("-2 days"), and the
+ * first tick after a deploy backfills the whole history, bounded per granularity (see
+ * RollupWindows) rather than scanning every row ever written. Making the backfill the
+ * same code as the repair means the backfill is exercised in production every day
+ * instead of being a one-shot script nobody runs twice.
+ *
+ * DO UPDATE *replaces* here, where the write path adds. That is what makes this safe to
+ * run against a live worker: re-running it, or overlapping it with incremental upserts,
+ * converges instead of double-counting.
+ */
+export async function recomputeRollup(
+  db: D1Database,
+  since: string | null | RollupWindows
+): Promise<void> {
+  // A numbered parameter, not the bare "?" that CUTOFF's other callers bind at most
+  // once each: bucketExpr("15m", x) references x twice (the hour part and the minute
+  // part), so the same bound value has to land in both spots within one WHERE clause.
+  // Defined locally rather than changing CUTOFF itself -- other callers depend on its
+  // current shape.
+  //
+  // The cutoff is floored to each granularity's own bucket boundary (not compared
+  // against a raw wall-clock instant) so a bucket is either wholly inside the window or
+  // wholly outside it. A bucket split across the boundary would recompute from only its
+  // post-cutoff rows, and because DO UPDATE below *replaces*, that would silently
+  // overwrite a previously-correct bucket with an undercounted one -- permanently, since
+  // the next day's cutoff moves past it and it never gets revisited. The comparison
+  // stays "timestamp >= <floored constant>", with the raw column on the left, so
+  // idx_checks_timestamp still answers it; flooring the column itself on the left would
+  // turn this into a full table scan.
+  const cutoffExpr = `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)`;
+
+  // Normalizes the string|null|RollupWindows union into one lookup per table so the
+  // statement builders below don't need to branch on which form the caller passed.
+  const windows: RollupWindows =
+    since === null
+      ? { check: { "15m": null, "1h": null, "1d": null }, service: null }
+      : typeof since === "string"
+        ? { check: { "15m": since, "1h": since, "1d": since }, service: since }
+        : since;
+
+  const bindTo = (stmt: D1PreparedStatement, window: string | null) =>
+    window === null ? stmt : stmt.bind(window);
+
+  // Derived from LAYERS (rollup.ts) instead of hand-copied: checkRollupUpsertSql builds
+  // its column list the same way, so the two agree by construction rather than by
+  // someone remembering to keep three lists in sync.
+  const checkCols = [
+    "n", "n_offline", "n_degraded", "sum_response_ms", "n_response",
+    ...LAYERS.flatMap(l => [`sum_${l}_ms`, `n_${l}`]),
+  ];
+  const layerAggs = LAYERS
+    .map(l => `COALESCE(SUM(${l}_ms), 0), COUNT(${l}_ms)`)
+    .join(", ");
+
+  const checkStmts = CHECK_GRANULARITIES.map(g => {
+    const since_g = windows.check[g];
+    const window = since_g === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
+    return bindTo(
+      db.prepare(
+        `INSERT INTO check_rollup (granularity, bucket_start, ${checkCols.join(", ")})
+         SELECT '${g}',
+                ${bucketExpr(g, "timestamp")},
+                COUNT(*),
+                SUM(CASE WHEN status = 'offline'  THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'degraded' THEN 1 ELSE 0 END),
+                COALESCE(SUM(response_time_ms), 0), COUNT(response_time_ms),
+                ${layerAggs}
+         FROM checks
+         ${window}
+         GROUP BY 2
+         ON CONFLICT(granularity, bucket_start) DO UPDATE SET
+           ${checkCols.map(c => `${c} = excluded.${c}`).join(", ")}`
+      ),
+      since_g
+    );
+  });
+
+  const serviceStmts = SERVICE_GRANULARITIES.map(g => {
+    const since_s = windows.service;
+    const window = since_s === null ? "" : `WHERE timestamp >= ${bucketExpr(g, cutoffExpr)}`;
+    return bindTo(
+      db.prepare(
+        `INSERT INTO other_service_rollup (granularity, bucket_start, service_id, n, sum_response_ms, n_response)
+         SELECT '${g}',
+                ${bucketExpr(g, "timestamp")},
+                service_id,
+                COUNT(*),
+                COALESCE(SUM(response_time_ms), 0),
+                COUNT(response_time_ms)
+         FROM other_service_checks
+         ${window}
+         GROUP BY 2, 3
+         ON CONFLICT(granularity, bucket_start, service_id) DO UPDATE SET
+           n = excluded.n,
+           sum_response_ms = excluded.sum_response_ms,
+           n_response      = excluded.n_response`
+      ),
+      since_s
+    );
+  });
+
+  await db.batch([...checkStmts, ...serviceStmts]);
 }
 
 export async function saveOtherServiceChecks(
@@ -117,27 +291,60 @@ export async function saveOtherServiceChecks(
   results: OtherServiceCheckResult[]
 ): Promise<void> {
   if (results.length === 0) return;
-  const stmt = db.prepare(
-    `INSERT INTO other_service_checks (service_id, status, http_code, response_time_ms, error)
-     VALUES (?, ?, ?, ?, ?)`
+
+  // Bound for the same reason as in saveCheck: one clock reading for the row and
+  // for every bucket it feeds.
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  const insert = db.prepare(
+    `INSERT INTO other_service_checks (timestamp, service_id, status, http_code, response_time_ms, error)
+     VALUES (?, ?, ?, ?, ?, ?)`
   );
-  await db.batch(results.map(r => stmt.bind(r.serviceId, r.status, r.httpCode, r.responseTimeMs, r.error)));
+
+  await db.batch([
+    ...results.map(r =>
+      insert.bind(timestamp, r.serviceId, r.status, r.httpCode, r.responseTimeMs, r.error)
+    ),
+    ...SERVICE_GRANULARITIES.flatMap(g => {
+      const upsert = db.prepare(serviceRollupUpsertSql(g));
+      return results.map(r => upsert.bind(timestamp, r.serviceId, r.responseTimeMs));
+    }),
+  ]);
 }
 
-export async function getOtherServiceHistoryRaw(
+export async function getOtherServiceHistory(
   db: D1Database,
   period: "24h" | "7d" | "30d"
-): Promise<RawOtherServiceRow[]> {
-  const interval = period === "30d" ? "-30 days" : period === "7d" ? "-7 days" : "-24 hours";
+): Promise<OtherServiceHistoryRow[]> {
+  if (period === "24h") {
+    // 3-minute points: the raw rows already are the chart's resolution.
+    const result = await db
+      .prepare(
+        `SELECT timestamp, service_id, COALESCE(response_time_ms, 0) AS sum_response_ms,
+                CASE WHEN response_time_ms IS NULL THEN 0 ELSE 1 END AS n_response
+         FROM other_service_checks
+         WHERE timestamp >= ${CUTOFF}
+         ORDER BY timestamp ASC`
+      )
+      .bind("-24 hours")
+      .all<OtherServiceHistoryRow>();
+    return result.results;
+  }
+
+  // 7d wants 15-minute points, 30d hourly ones -- both stored directly, so this reads
+  // 2,688 and 2,880 rows where it used to pull 12,976 and 45,792 raw ones into the
+  // isolate to bucket them in JS.
+  const granularity = period === "7d" ? "15m" : "1h";
   const result = await db
     .prepare(
-      `SELECT timestamp, service_id, response_time_ms
-       FROM other_service_checks
-       WHERE timestamp >= ${CUTOFF}
-       ORDER BY timestamp ASC`
+      `SELECT bucket_start AS timestamp, service_id, sum_response_ms, n_response
+       FROM other_service_rollup
+       WHERE granularity = '${granularity}'
+         AND bucket_start >= ${CUTOFF}
+       ORDER BY bucket_start ASC`
     )
-    .bind(interval)
-    .all<RawOtherServiceRow>();
+    .bind(period === "7d" ? "-7 days" : "-30 days")
+    .all<OtherServiceHistoryRow>();
   return result.results;
 }
 
@@ -188,57 +395,68 @@ export async function getHistory(
   db: D1Database,
   period: string
 ): Promise<CheckRow[]> {
-  const interval = periodToInterval(period);
-
   if (period === "24h") {
-    // Return all checks for 24h (max ~480 rows)
+    // Raw 3-minute points, the cron's own cadence -- there is nothing to downsample.
     const result = await db
       .prepare(
         `SELECT * FROM checks
          WHERE timestamp >= ${CUTOFF}
          ORDER BY timestamp ASC`
       )
-      .bind(interval)
+      .bind(periodToInterval(period))
       .all<CheckRow>();
     return result.results;
   }
 
-  // For 7d/30d/90d, downsample by grouping into time buckets
-  const bucketMinutes = period === "7d" ? 15 : period === "30d" ? 60 : 180;
+  // 7d wants 15-minute points and 30d wants hourly ones, which the rollup stores
+  // directly; 90d wants 3-hour points, built by grouping three hourly buckets. Reading
+  // the coarser granularity is what keeps 90d at 2,160 rows instead of 87,879.
+  const granularity = period === "7d" ? "15m" : "1h";
+  const groupHours = period === "90d" ? 3 : 0;
+
+  const bucketKey = groupHours
+    ? `strftime('%Y-%m-%dT', bucket_start) || printf('%02d:00:00Z', (CAST(strftime('%H', bucket_start) AS INTEGER) / ${groupHours}) * ${groupHours})`
+    : `bucket_start`;
+
+  // A layer that never ran inside the group has n = 0. It has to come back NULL, the
+  // way AVG() returned NULL over an all-NULL window: a 0 would draw a floor-hugging
+  // line in LayerResponseChart instead of a gap.
+  const avg = (col: string, n: string) =>
+    `CASE WHEN SUM(${n}) = 0 THEN NULL ELSE ROUND(CAST(SUM(${col}) AS REAL) / SUM(${n})) END`;
 
   const result = await db
     .prepare(
       `SELECT
-         id,
-         MIN(timestamp) as timestamp,
+         CAST(strftime('%s', MIN(bucket_start)) AS INTEGER) as id,
+         MIN(bucket_start) as timestamp,
          CASE
-           WHEN SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END) > 0 THEN 'offline'
-           WHEN SUM(CASE WHEN status = 'degraded' THEN 1 ELSE 0 END) > 0 THEN 'degraded'
+           WHEN SUM(n_offline)  > 0 THEN 'offline'
+           WHEN SUM(n_degraded) > 0 THEN 'degraded'
            ELSE 'online'
          END as status,
-         ROUND(AVG(http_code)) as http_code,
-         ROUND(AVG(response_time_ms)) as response_time_ms,
+         NULL as http_code,
+         ${avg("sum_response_ms", "n_response")} as response_time_ms,
          NULL as error,
          NULL as reachability_status,
-         ROUND(AVG(reachability_http)) as reachability_http,
-         ROUND(AVG(reachability_ms)) as reachability_ms,
+         NULL as reachability_http,
+         ${avg("sum_reachability_ms", "n_reachability")} as reachability_ms,
          NULL as reachability_error,
          NULL as portal_status,
-         ROUND(AVG(portal_ms)) as portal_ms,
+         ${avg("sum_portal_ms", "n_portal")} as portal_ms,
          NULL as portal_error,
          NULL as login_form_status,
-         ROUND(AVG(login_form_ms)) as login_form_ms,
+         ${avg("sum_login_form_ms", "n_login_form")} as login_form_ms,
          NULL as login_form_error,
          NULL as login_e2e_status,
-         ROUND(AVG(login_e2e_ms)) as login_e2e_ms,
+         ${avg("sum_login_e2e_ms", "n_login_e2e")} as login_e2e_ms,
          NULL as login_e2e_error
-       FROM checks
-       WHERE timestamp >= ${CUTOFF}
-       GROUP BY strftime('%Y-%m-%dT%H:', timestamp) ||
-         printf('%02d', (CAST(strftime('%M', timestamp) AS INTEGER) / ${bucketMinutes}) * ${bucketMinutes})
-       ORDER BY timestamp ASC`
+       FROM check_rollup
+       WHERE granularity = '${granularity}'
+         AND bucket_start >= ${CUTOFF}
+       GROUP BY ${bucketKey}
+       ORDER BY ${bucketKey} ASC`
     )
-    .bind(interval)
+    .bind(periodToInterval(period))
     .all<CheckRow>();
   return result.results;
 }
@@ -248,46 +466,76 @@ export async function getStats(
 ): Promise<Record<string, { uptimePercent: number; avgResponseMs: number; incidentCount: number }>> {
   const periods = ["24h", "7d", "30d", "90d"] as const;
 
-  // The loop this replaces awaited two queries per period -- eight round trips to the
-  // D1 primary for eight rows. The SQL is not the cost here: the 90-day aggregate, the
-  // heaviest of the eight, runs in about 24ms, while the endpoint took roughly 1.2s on
-  // a cache miss. batch() sends all eight as one request.
-  const checksStmt = db.prepare(
-    `SELECT
-       ROUND(100.0 * SUM(CASE WHEN status != 'offline' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2) AS uptime_pct,
-       ROUND(AVG(response_time_ms)) AS avg_ms
-     FROM checks
-     WHERE timestamp >= ${CUTOFF}`
-  );
-  const incidentsStmt = db.prepare(
-    `SELECT COUNT(*) as count FROM incidents
-     WHERE started_at >= ${CUTOFF}`
-  );
+  // This used to run eight statements that each scanned their raw window -- 60,750 rows
+  // per cache miss, half the account's entire daily D1 budget on one endpoint. The
+  // windows are now conditional sums over pre-aggregated buckets: one 90-row scan of the
+  // daily rollup covers 7d/30d/90d, and 24 hourly rows cover 24h.
+  //
+  // 7d/30d/90d snap to day boundaries, so the window is "the last N whole days plus
+  // today". Uptime moves in the rounding of the trailing hours only.
+  // Day-floored, not "now minus N days": the daily buckets sit at T00:00:00Z, so a
+  // cutoff carrying a time of day would drop the oldest bucket and make the window one
+  // day narrower than it reads. Floored, "-90 days" means 90 whole days plus today.
+  const dayCutoff = (days: number) =>
+    `strftime('%Y-%m-%dT00:00:00Z','now','-${days} days')`;
+  const windowed = (col: string, days: number) =>
+    `SUM(CASE WHEN bucket_start >= ${dayCutoff(days)} THEN ${col} ELSE 0 END)`;
 
-  // Checks first, then incidents, so a period's two rows sit at i and i + periods.length.
-  const rows = await db.batch<Record<string, unknown>>([
-    ...periods.map(period => checksStmt.bind(periodToInterval(period))),
-    ...periods.map(period => incidentsStmt.bind(periodToInterval(period))),
+  const [daily, hourly, incidents] = await db.batch<Record<string, number | null>>([
+    db.prepare(
+      `SELECT ${([7, 30, 90] as const)
+        .map(days => `${windowed("n", days)} AS n_${days}, ${windowed("n_offline", days)} AS off_${days}, ${windowed("sum_response_ms", days)} AS sum_${days}, ${windowed("n_response", days)} AS nr_${days}`)
+        .join(", ")}
+       FROM check_rollup
+       WHERE granularity = '1d' AND bucket_start >= ${dayCutoff(90)}`
+    ),
+    db.prepare(
+      `SELECT SUM(n) AS n, SUM(n_offline) AS off, SUM(sum_response_ms) AS sum, SUM(n_response) AS nr
+       FROM check_rollup
+       WHERE granularity = '1h'
+         AND bucket_start >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-24 hours')`
+    ),
+    // Incidents stay on the raw table: idx_incidents_started already answers this and
+    // the measured cost was ~0. One statement instead of four, same trick.
+    //
+    // Its cutoff is wall-clock ("now minus N days"), not day-floored like dayCutoff()
+    // above -- so for a period like "7d", uptimePercent and avgResponseMs describe the
+    // last 7 whole days plus today, while incidentCount describes a rolling last-7×24h
+    // window ending at this instant. The two halves of one period cover slightly
+    // different spans. Spec-permitted (incidents are cheap enough to answer exactly,
+    // so there was no reason to snap them to the same day-floored window the rollup
+    // needs), just worth knowing before reading too much into a boundary case.
+    db.prepare(
+      `SELECT
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-24 hours') THEN 1 ELSE 0 END) AS c_24h,
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days')   THEN 1 ELSE 0 END) AS c_7d,
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')  THEN 1 ELSE 0 END) AS c_30d,
+         SUM(CASE WHEN started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-90 days')  THEN 1 ELSE 0 END) AS c_90d
+       FROM incidents
+       WHERE started_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-90 days')`
+    ),
   ]);
+
+  const day = daily.results[0] ?? {};
+  const hour = hourly.results[0] ?? {};
+  const inc = incidents.results[0] ?? {};
 
   const stats: Record<string, { uptimePercent: number; avgResponseMs: number; incidentCount: number }> = {};
 
-  periods.forEach((period, i) => {
-    // Both are aggregates over a possibly empty window, so the row always exists but
-    // its columns can be NULL -- the fallbacks below carry that case, as before.
-    const checks = rows[i].results[0] as
-      | { uptime_pct: number | null; avg_ms: number | null }
-      | undefined;
-    const incidents = rows[i + periods.length].results[0] as
-      | { count: number | null }
-      | undefined;
+  for (const period of periods) {
+    const suffix = period === "24h" ? null : period.replace("d", "");
+    const n = Number((suffix ? day[`n_${suffix}`] : hour.n) ?? 0);
+    const off = Number((suffix ? day[`off_${suffix}`] : hour.off) ?? 0);
+    const sum = Number((suffix ? day[`sum_${suffix}`] : hour.sum) ?? 0);
+    const nr = Number((suffix ? day[`nr_${suffix}`] : hour.nr) ?? 0);
 
     stats[period] = {
-      uptimePercent: checks?.uptime_pct ?? 100,
-      avgResponseMs: checks?.avg_ms ?? 0,
-      incidentCount: incidents?.count ?? 0,
+      // "degraded" counts as up, matching the status != 'offline' the raw query used.
+      uptimePercent: n === 0 ? 100 : Math.round((100 * (n - off)) / n * 100) / 100,
+      avgResponseMs: nr === 0 ? 0 : Math.round(sum / nr),
+      incidentCount: Number(inc[`c_${period}`] ?? 0),
     };
-  });
+  }
 
   return stats;
 }

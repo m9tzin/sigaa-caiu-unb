@@ -1,0 +1,57 @@
+name: Verify
+
+# Checks that never deploy. Runs on every branch and on pull requests, so a schema
+# mismatch or a type error is visible before it reaches main -- where the deploy
+# workflow acts on it automatically.
+#
+# Deploy Worker only fires on push to main, so until this existed there was no way to
+# exercise the D1 credential without publishing a Worker. That gap is why a token
+# without D1:Read went unnoticed for weeks: db:verify failed with 7403 on every
+# deploy, warned, and shipped anyway.
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: worker
+
+      - name: Typecheck
+        working-directory: worker
+        run: npm run typecheck
+
+      # Reports drift without blocking: this workflow runs on feature branches, where
+      # the schema legitimately runs ahead of the database. The deploy workflow is the
+      # one that blocks. What matters here is that the credential works at all -- an
+      # exit 2 means the token still cannot read D1, and the deploy will refuse.
+      - name: Verify database schema (report only)
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set +e
+          npm run db:verify
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::notice::Banco em dia com schema.sql, e o token consegue ler o D1."
+          elif [ "$code" -eq 1 ]; then
+            echo "::warning::O banco divergiu de schema.sql. Numa branch isso e esperado ate o schema ser aplicado; na main o deploy vai barrar."
+          else
+            echo "::error::db:verify nao conseguiu consultar o D1 (exit $code). O token do CI precisa de Account > D1 > Read, senao o deploy vai barrar."
+            exit 1
+          fi
